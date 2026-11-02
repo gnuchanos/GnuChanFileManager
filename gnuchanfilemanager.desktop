@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GnuChanFileManager
+GenericName=File Manager
+Comment=Browse and manage files
+Exec=GnuChanFileManager %U
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileTools;FileManager;
+StartupNotify=true
+MimeType=inode/directory;
