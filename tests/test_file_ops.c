@@ -25,6 +25,31 @@ static void test_safe_names(void) {
     g_assert_false(gfm_name_is_safe("folder\\name"));
 }
 
+static void test_parse_uri_clipboard_data(void) {
+    gchar *path = g_build_filename(test_root, "copied file.txt", NULL);
+    GFile *expected = g_file_new_for_path(path);
+    gchar *uri = g_file_get_uri(expected);
+    gchar *clipboard = g_strdup_printf("cut\n%s\r\nnot a URI\n"
+                                       "$(touch should-not-run)\n",
+                                       uri);
+    gboolean move = FALSE;
+    GPtrArray *files = gfm_parse_uri_list(clipboard, &move);
+    g_assert_true(move);
+    g_assert_cmpuint(files->len, ==, 1);
+    g_assert_true(g_file_equal(expected, g_ptr_array_index(files, 0)));
+
+    GPtrArray *uri_list = gfm_parse_uri_list(uri, &move);
+    g_assert_false(move);
+    g_assert_cmpuint(uri_list->len, ==, 1);
+
+    g_ptr_array_unref(uri_list);
+    g_ptr_array_unref(files);
+    g_free(clipboard);
+    g_free(uri);
+    g_object_unref(expected);
+    g_free(path);
+}
+
 static void test_copy_move_rename_delete(void) {
     GError *error = NULL;
     gchar *from_path = g_build_filename(test_root, "from", NULL);
@@ -144,6 +169,8 @@ int main(int argc, char **argv) {
     }
     g_assert_cmpint(g_mkdir_with_parents(test_root, 0700), ==, 0);
     g_test_add_func("/file-ops/safe-names", test_safe_names);
+    g_test_add_func("/file-ops/parse-uri-clipboard-data",
+                    test_parse_uri_clipboard_data);
     g_test_add_func("/file-ops/copy-move-rename-delete",
                     test_copy_move_rename_delete);
     g_test_add_func("/file-ops/refuse-copy-into-self",

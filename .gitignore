@@ -1,0 +1,14 @@
+# Native build output
+/build/
+/GnuChanFileManager
+*.o
+*.a
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

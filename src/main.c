@@ -6,6 +6,19 @@
 #define APP_ID "org.gnuchan.GnuChanFileManager"
 
 enum { COL_NAME, COL_TYPE, COL_SIZE, COL_FILE, N_COLUMNS };
+enum {
+    SIDE_NAME,
+    SIDE_FILE,
+    SIDE_VOLUME,
+    SIDE_MOUNT,
+    SIDE_LOADED,
+    N_SIDE_COLUMNS
+};
+
+typedef struct {
+    GFile *file;
+    gboolean move;
+} ClipboardFile;
 
 typedef struct {
     GtkApplication *application;
@@ -18,13 +31,26 @@ typedef struct {
     GtkWidget *hidden_button;
     GtkWidget *view;
     GtkListStore *store;
+    GtkWidget *sidebar;
+    GtkTreeStore *sidebar_store;
+    GVolumeMonitor *volume_monitor;
     GFile *location;
     GPtrArray *history;
     guint history_index;
     gboolean show_hidden;
     gchar *config_path;
     gchar *start_location;
+    gulong volume_added_handler;
+    gulong volume_removed_handler;
+    gulong mount_added_handler;
+    gulong mount_removed_handler;
 } App;
+
+static void on_back(GtkButton *button, gpointer data);
+static void on_forward(GtkButton *button, gpointer data);
+static void on_up(GtkButton *button, gpointer data);
+static void on_volume_mounted(GObject *source, GAsyncResult *result,
+                              gpointer data);
 
 static void show_error(App *app, const gchar *summary, GError *error) {
     GtkWidget *dialog = gtk_message_dialog_new(
@@ -341,6 +367,274 @@ static void on_operation_clicked(GtkButton *button, gpointer data) {
     do_operation(data, g_object_get_data(G_OBJECT(button), "operation"));
 }
 
+static void clipboard_file_free(gpointer data) {
+    ClipboardFile *clipboard_file = data;
+    g_clear_object(&clipboard_file->file);
+    g_free(clipboard_file);
+}
+
+static void clipboard_get_data(GtkClipboard *clipboard,
+                               GtkSelectionData *selection_data,
+                               guint info, gpointer data) {
+    (void)clipboard;
+    ClipboardFile *clipboard_file = data;
+    gchar *uri = g_file_get_uri(clipboard_file->file);
+    gchar *contents = info == 0
+                          ? g_strdup_printf("%s\n%s\n",
+                                            clipboard_file->move ? "cut" :
+                                                                   "copy",
+                                            uri)
+                          : g_strdup_printf("%s\r\n", uri);
+    gtk_selection_data_set(selection_data,
+                           gtk_selection_data_get_target(selection_data), 8,
+                           (const guchar *)contents, (gint)strlen(contents));
+    g_free(contents);
+    g_free(uri);
+}
+
+static void clipboard_clear_data(GtkClipboard *clipboard, gpointer data) {
+    (void)clipboard;
+    clipboard_file_free(data);
+}
+
+static void set_file_clipboard(App *app, gboolean move) {
+    GFile *file = selected_file(app);
+    if (file == NULL) {
+        return;
+    }
+    static GtkTargetEntry targets[] = {
+        {(gchar *)"x-special/gnome-copied-files", 0, 0},
+        {(gchar *)"text/uri-list", 0, 1}
+    };
+    ClipboardFile *clipboard_file = g_new0(ClipboardFile, 1);
+    clipboard_file->file = file;
+    clipboard_file->move = move;
+    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    if (!gtk_clipboard_set_with_data(clipboard, targets, G_N_ELEMENTS(targets),
+                                     clipboard_get_data,
+                                     clipboard_clear_data, clipboard_file)) {
+        clipboard_file_free(clipboard_file);
+    }
+}
+
+static gboolean paste_uri_list(App *app, const gchar *contents,
+                               gboolean move, GFile *destination_directory) {
+    GPtrArray *files = gfm_parse_uri_list(contents, &move);
+    if (files == NULL) {
+        return FALSE;
+    }
+    gboolean changed = FALSE;
+    GError *error = NULL;
+    for (guint i = 0; i < files->len; i++) {
+        GFile *source = g_ptr_array_index(files, i);
+        gboolean success = move
+                               ? gfm_move_to_directory(source,
+                                                       destination_directory,
+                                                       &error)
+                               : gfm_copy_to_directory(source,
+                                                       destination_directory,
+                                                       &error);
+        if (!success) {
+            break;
+        }
+        changed = TRUE;
+    }
+    g_ptr_array_unref(files);
+    if (error != NULL) {
+        show_error(app, "Could not paste the selected item.", error);
+        g_clear_error(&error);
+    } else if (changed) {
+        refresh_listing(app);
+    }
+    return changed;
+}
+
+static void paste_clipboard(App *app) {
+    GFile *destination = NULL;
+    GFile *selection = selected_file(app);
+    if (selection != NULL &&
+        g_file_query_file_type(selection, G_FILE_QUERY_INFO_NONE, NULL) ==
+            G_FILE_TYPE_DIRECTORY) {
+        destination = g_object_ref(selection);
+    } else {
+        destination = g_object_ref(app->location);
+    }
+    g_clear_object(&selection);
+
+    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    GdkAtom gnome_target =
+        gdk_atom_intern_static_string("x-special/gnome-copied-files");
+    GtkSelectionData *selection_data =
+        gtk_clipboard_wait_for_contents(clipboard, gnome_target);
+    if (selection_data == NULL) {
+        selection_data = gtk_clipboard_wait_for_contents(
+            clipboard, gdk_atom_intern_static_string("text/uri-list"));
+    }
+    if (selection_data != NULL) {
+        gint length = gtk_selection_data_get_length(selection_data);
+        const guchar *bytes = gtk_selection_data_get_data(selection_data);
+        if (length > 0 && bytes != NULL) {
+            gchar *contents = g_strndup((const gchar *)bytes, (gsize)length);
+            paste_uri_list(app, contents, FALSE, destination);
+            g_free(contents);
+        }
+        gtk_selection_data_free(selection_data);
+    }
+    g_object_unref(destination);
+}
+
+static void open_selected(App *app) {
+    GFile *file = selected_file(app);
+    if (file == NULL) {
+        return;
+    }
+    GError *error = NULL;
+    if (g_file_query_file_type(file, G_FILE_QUERY_INFO_NONE, NULL) ==
+        G_FILE_TYPE_DIRECTORY) {
+        go_to(app, file, TRUE);
+    } else {
+        gchar *uri = g_file_get_uri(file);
+        g_app_info_launch_default_for_uri(uri, NULL, &error);
+        g_free(uri);
+    }
+    if (error != NULL) {
+        show_error(app, "Could not open the selected item.", error);
+        g_clear_error(&error);
+    }
+    g_object_unref(file);
+}
+
+static void on_file_context_action(GtkMenuItem *item, gpointer data) {
+    App *app = data;
+    const gchar *action = g_object_get_data(G_OBJECT(item), "action");
+    if (g_str_equal(action, "open")) {
+        open_selected(app);
+    } else if (g_str_equal(action, "copy-clipboard")) {
+        set_file_clipboard(app, FALSE);
+    } else if (g_str_equal(action, "cut")) {
+        set_file_clipboard(app, TRUE);
+    } else if (g_str_equal(action, "paste")) {
+        paste_clipboard(app);
+    } else if (g_str_equal(action, "copy") || g_str_equal(action, "move") ||
+               g_str_equal(action, "rename") ||
+               g_str_equal(action, "trash") ||
+               g_str_equal(action, "delete")) {
+        do_operation(app, action);
+    }
+}
+
+static void append_context_item(GtkWidget *menu, const gchar *label,
+                                const gchar *action, App *app) {
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_object_set_data(G_OBJECT(item), "action", (gpointer)action);
+    g_signal_connect(item, "activate", G_CALLBACK(on_file_context_action),
+                     app);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static gboolean on_file_button_press(GtkWidget *widget, GdkEventButton *event,
+                                     gpointer data) {
+    if (event->type != GDK_BUTTON_PRESS || event->button != GDK_BUTTON_SECONDARY) {
+        return FALSE;
+    }
+    App *app = data;
+    GtkTreePath *path = NULL;
+    if (gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget), (gint)event->x,
+                                      (gint)event->y, &path, NULL, NULL,
+                                      NULL)) {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(
+            GTK_TREE_VIEW(widget));
+        gtk_tree_selection_select_path(selection, path);
+        gtk_tree_path_free(path);
+    } else {
+        gtk_tree_selection_unselect_all(
+            gtk_tree_view_get_selection(GTK_TREE_VIEW(widget)));
+    }
+    GtkWidget *menu = gtk_menu_new();
+    GFile *selected = selected_file(app);
+    gboolean has_selection = selected != NULL;
+    g_clear_object(&selected);
+    if (has_selection) {
+        append_context_item(menu, "Open", "open", app);
+        append_context_item(menu, "Copy", "copy-clipboard", app);
+        append_context_item(menu, "Cut", "cut", app);
+    }
+    append_context_item(menu, "Paste", "paste", app);
+    if (has_selection) {
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                              gtk_separator_menu_item_new());
+        append_context_item(menu, "Copy to…", "copy", app);
+        append_context_item(menu, "Move to…", "move", app);
+        append_context_item(menu, "Rename…", "rename", app);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                              gtk_separator_menu_item_new());
+        append_context_item(menu, "Move to Trash", "trash", app);
+        append_context_item(menu, "Delete Permanently…", "delete", app);
+    }
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+    return TRUE;
+}
+
+static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event,
+                                    gpointer data) {
+    (void)widget;
+    App *app = data;
+    GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
+    gboolean control = (modifiers & GDK_CONTROL_MASK) != 0;
+    gboolean shift = (modifiers & GDK_SHIFT_MASK) != 0;
+    gboolean alt = (modifiers & GDK_MOD1_MASK) != 0;
+    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(app->window));
+    gboolean list_focused = focus == app->view;
+
+    if (control && event->keyval == GDK_KEY_l) {
+        gtk_widget_grab_focus(app->address);
+        gtk_editable_select_region(GTK_EDITABLE(app->address), 0, -1);
+        return TRUE;
+    }
+    if (control && event->keyval == GDK_KEY_h) {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hidden_button),
+                                     !app->show_hidden);
+        return TRUE;
+    }
+    if (alt && event->keyval == GDK_KEY_Left) {
+        on_back(NULL, app);
+        return TRUE;
+    }
+    if (alt && event->keyval == GDK_KEY_Right) {
+        on_forward(NULL, app);
+        return TRUE;
+    }
+    if (alt && event->keyval == GDK_KEY_Up) {
+        on_up(NULL, app);
+        return TRUE;
+    }
+    if (!list_focused) {
+        return FALSE;
+    }
+    if (control && event->keyval == GDK_KEY_c) {
+        set_file_clipboard(app, FALSE);
+        return TRUE;
+    }
+    if (control && event->keyval == GDK_KEY_x) {
+        set_file_clipboard(app, TRUE);
+        return TRUE;
+    }
+    if (control && event->keyval == GDK_KEY_v) {
+        paste_clipboard(app);
+        return TRUE;
+    }
+    if (event->keyval == GDK_KEY_F2) {
+        do_operation(app, "rename");
+        return TRUE;
+    }
+    if (event->keyval == GDK_KEY_Delete) {
+        do_operation(app, shift ? "delete" : "trash");
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void on_back(GtkButton *button, gpointer data) {
     (void)button;
     App *app = data;
@@ -417,6 +711,300 @@ static void add_text_column(GtkTreeView *view, const gchar *title,
     gtk_tree_view_append_column(view, column);
 }
 
+static void sidebar_add_placeholder(App *app, GtkTreeIter *parent) {
+    GtkTreeIter child;
+    gtk_tree_store_append(app->sidebar_store, &child, parent);
+    gtk_tree_store_set(app->sidebar_store, &child, SIDE_NAME, "", SIDE_LOADED,
+                       TRUE, -1);
+}
+
+static void sidebar_add_root(App *app, const gchar *name, GFile *file,
+                             GVolume *volume, GMount *mount) {
+    GtkTreeIter iter;
+    gtk_tree_store_append(app->sidebar_store, &iter, NULL);
+    gtk_tree_store_set(app->sidebar_store, &iter, SIDE_NAME, name, SIDE_FILE,
+                       file, SIDE_VOLUME, volume, SIDE_MOUNT, mount,
+                       SIDE_LOADED, FALSE, -1);
+    GMount *volume_mount = volume != NULL ? g_volume_get_mount(volume) : NULL;
+    if (file != NULL ||
+        (volume != NULL && (g_volume_can_mount(volume) || volume_mount != NULL))) {
+        sidebar_add_placeholder(app, &iter);
+    }
+    g_clear_object(&volume_mount);
+}
+
+static void refresh_sidebar(App *app) {
+    if (app->sidebar_store == NULL) {
+        return;
+    }
+    gtk_tree_store_clear(app->sidebar_store);
+    GFile *home = g_file_new_for_path(g_get_home_dir());
+    GFile *root = g_file_new_for_path(G_DIR_SEPARATOR_S);
+    sidebar_add_root(app, "Home", home, NULL, NULL);
+    sidebar_add_root(app, "File System", root, NULL, NULL);
+    g_object_unref(home);
+    g_object_unref(root);
+
+    GList *volumes = g_volume_monitor_get_volumes(app->volume_monitor);
+    for (GList *item = volumes; item != NULL; item = item->next) {
+        GVolume *volume = item->data;
+        GMount *mount = g_volume_get_mount(volume);
+        if (mount != NULL || g_volume_can_mount(volume)) {
+            gchar *name = g_volume_get_name(volume);
+            GFile *mount_root = mount != NULL ? g_mount_get_root(mount) : NULL;
+            sidebar_add_root(app, name, mount_root, volume, mount);
+            g_free(name);
+            g_clear_object(&mount_root);
+        }
+        g_clear_object(&mount);
+    }
+    g_list_free_full(volumes, g_object_unref);
+
+    GList *mounts = g_volume_monitor_get_mounts(app->volume_monitor);
+    for (GList *item = mounts; item != NULL; item = item->next) {
+        GMount *mount = item->data;
+        GVolume *volume = g_mount_get_volume(mount);
+        if (volume == NULL &&
+            (g_mount_can_unmount(mount) || g_mount_can_eject(mount))) {
+            gchar *name = g_mount_get_name(mount);
+            gchar *label = g_strdup_printf("Mounted: %s", name);
+            GFile *mount_root = g_mount_get_root(mount);
+            sidebar_add_root(app, label, mount_root, NULL, mount);
+            g_object_unref(mount_root);
+            g_free(label);
+            g_free(name);
+        }
+        g_clear_object(&volume);
+    }
+    g_list_free_full(mounts, g_object_unref);
+}
+
+static void on_sidebar_row_expanded(GtkTreeView *tree_view, GtkTreeIter *iter,
+                                    GtkTreePath *path, gpointer data) {
+    (void)tree_view;
+    (void)path;
+    App *app = data;
+    gboolean loaded = FALSE;
+    GFile *directory = NULL;
+    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), iter,
+                       SIDE_LOADED, &loaded, SIDE_FILE, &directory, -1);
+    if (loaded || directory == NULL) {
+        g_clear_object(&directory);
+        return;
+    }
+    GtkTreeIter child;
+    while (gtk_tree_model_iter_children(GTK_TREE_MODEL(app->sidebar_store),
+                                        &child, iter)) {
+        gtk_tree_store_remove(app->sidebar_store, &child);
+    }
+    gtk_tree_store_set(app->sidebar_store, iter, SIDE_LOADED, TRUE, -1);
+
+    GError *error = NULL;
+    GFileEnumerator *enumerator = g_file_enumerate_children(
+        directory, G_FILE_ATTRIBUTE_STANDARD_NAME ","
+                   G_FILE_ATTRIBUTE_STANDARD_TYPE,
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
+    if (enumerator != NULL) {
+        GFileInfo *info;
+        while ((info = g_file_enumerator_next_file(enumerator, NULL, &error)) !=
+               NULL) {
+            if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
+                const gchar *name = g_file_info_get_name(info);
+                GFile *file = g_file_get_child(directory, name);
+                GtkTreeIter subdirectory;
+                gtk_tree_store_append(app->sidebar_store, &subdirectory, iter);
+                gtk_tree_store_set(app->sidebar_store, &subdirectory,
+                                   SIDE_NAME, name, SIDE_FILE, file,
+                                   SIDE_LOADED, FALSE, -1);
+                sidebar_add_placeholder(app, &subdirectory);
+                g_object_unref(file);
+            }
+            g_object_unref(info);
+        }
+        if (error != NULL) {
+            g_clear_error(&error);
+        }
+        g_object_unref(enumerator);
+    }
+    g_clear_object(&directory);
+}
+
+static void on_sidebar_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
+                                    GtkTreeViewColumn *column, gpointer data) {
+    (void)column;
+    App *app = data;
+    GtkTreeIter iter;
+    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->sidebar_store), &iter,
+                                 path)) {
+        return;
+    }
+    GFile *file = NULL;
+    GVolume *volume = NULL;
+    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &iter,
+                       SIDE_FILE, &file, SIDE_VOLUME, &volume, -1);
+    if (file != NULL) {
+        go_to(app, file, TRUE);
+    } else if (volume != NULL && g_volume_can_mount(volume)) {
+        g_volume_mount(volume, G_MOUNT_MOUNT_NONE, NULL, NULL,
+                       on_volume_mounted, app);
+    }
+    g_clear_object(&file);
+    g_clear_object(&volume);
+    (void)tree_view;
+}
+
+static void on_volume_mounted(GObject *source, GAsyncResult *result,
+                              gpointer data) {
+    App *app = data;
+    GError *error = NULL;
+    if (!g_volume_mount_finish(G_VOLUME(source), result, &error)) {
+        show_error(app, "Could not mount this device.", error);
+        g_clear_error(&error);
+        return;
+    }
+    GMount *mount = g_volume_get_mount(G_VOLUME(source));
+    if (mount != NULL) {
+        GFile *root = g_mount_get_root(mount);
+        go_to(app, root, TRUE);
+        g_object_unref(root);
+        g_object_unref(mount);
+    }
+    refresh_sidebar(app);
+}
+
+static void on_mount_unmounted(GObject *source, GAsyncResult *result,
+                               gpointer data) {
+    App *app = data;
+    GError *error = NULL;
+    if (!g_mount_unmount_with_operation_finish(G_MOUNT(source), result,
+                                               &error)) {
+        show_error(app, "Could not unmount this device.", error);
+        g_clear_error(&error);
+        return;
+    }
+    refresh_sidebar(app);
+}
+
+static void on_mount_ejected(GObject *source, GAsyncResult *result,
+                             gpointer data) {
+    App *app = data;
+    GError *error = NULL;
+    if (!g_mount_eject_with_operation_finish(G_MOUNT(source), result,
+                                             &error)) {
+        show_error(app, "Could not eject this device.", error);
+        g_clear_error(&error);
+        return;
+    }
+    refresh_sidebar(app);
+}
+
+static void on_device_menu_action(GtkMenuItem *item, gpointer data) {
+    App *app = data;
+    const gchar *action = g_object_get_data(G_OBJECT(item), "action");
+    GVolume *volume = g_object_get_data(G_OBJECT(item), "volume");
+    GMount *mount = g_object_get_data(G_OBJECT(item), "mount");
+    if (g_str_equal(action, "mount") && volume != NULL) {
+        g_volume_mount(volume, G_MOUNT_MOUNT_NONE, NULL, NULL,
+                       on_volume_mounted, app);
+    } else if (g_str_equal(action, "unmount")) {
+        GMount *target = mount != NULL ? g_object_ref(mount) :
+                         volume != NULL ? g_volume_get_mount(volume) : NULL;
+        if (target != NULL) {
+            g_mount_unmount_with_operation(target, G_MOUNT_UNMOUNT_NONE, NULL,
+                                           NULL, on_mount_unmounted, app);
+            g_object_unref(target);
+        }
+    } else if (g_str_equal(action, "eject") && mount != NULL) {
+        g_mount_eject_with_operation(mount, G_MOUNT_UNMOUNT_NONE, NULL, NULL,
+                                     on_mount_ejected, app);
+    }
+}
+
+static void append_device_menu_item(GtkWidget *menu, const gchar *label,
+                                    const gchar *action, GVolume *volume,
+                                    GMount *mount, App *app) {
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_object_set_data(G_OBJECT(item), "action", (gpointer)action);
+    if (volume != NULL) {
+        g_object_set_data_full(G_OBJECT(item), "volume",
+                               g_object_ref(volume), g_object_unref);
+    }
+    if (mount != NULL) {
+        g_object_set_data_full(G_OBJECT(item), "mount",
+                               g_object_ref(mount), g_object_unref);
+    }
+    g_signal_connect(item, "activate", G_CALLBACK(on_device_menu_action), app);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static gboolean on_sidebar_button_press(GtkWidget *widget,
+                                        GdkEventButton *event,
+                                        gpointer data) {
+    if (event->type != GDK_BUTTON_PRESS ||
+        event->button != GDK_BUTTON_SECONDARY) {
+        return FALSE;
+    }
+    App *app = data;
+    GtkTreePath *path = NULL;
+    if (!gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget), (gint)event->x,
+                                       (gint)event->y, &path, NULL, NULL,
+                                       NULL)) {
+        return FALSE;
+    }
+    GtkTreeIter iter;
+    GVolume *volume = NULL;
+    GMount *mount = NULL;
+    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->sidebar_store), &iter,
+                                 path)) {
+        gtk_tree_path_free(path);
+        return FALSE;
+    }
+    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &iter,
+                       SIDE_VOLUME, &volume, SIDE_MOUNT, &mount, -1);
+    gtk_tree_view_set_cursor(GTK_TREE_VIEW(widget), path, NULL, FALSE);
+    gtk_tree_path_free(path);
+    if (volume == NULL && mount == NULL) {
+        return FALSE;
+    }
+    GtkWidget *menu = gtk_menu_new();
+    GMount *actual_mount = mount != NULL ? g_object_ref(mount) :
+                           volume != NULL ? g_volume_get_mount(volume) : NULL;
+    if (actual_mount != NULL) {
+        if (g_mount_can_unmount(actual_mount)) {
+            append_device_menu_item(menu, "Unmount", "unmount", volume,
+                                    actual_mount, app);
+        }
+        if (g_mount_can_eject(actual_mount)) {
+            append_device_menu_item(menu, "Eject", "eject", volume,
+                                    actual_mount, app);
+        }
+        g_object_unref(actual_mount);
+    } else if (volume != NULL && g_volume_can_mount(volume)) {
+        append_device_menu_item(menu, "Mount", "mount", volume, NULL, app);
+    }
+    GList *items = gtk_container_get_children(GTK_CONTAINER(menu));
+    gboolean has_actions = items != NULL;
+    g_list_free(items);
+    if (!has_actions) {
+        gtk_widget_destroy(menu);
+        g_clear_object(&mount);
+        g_clear_object(&volume);
+        return FALSE;
+    }
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+    g_clear_object(&mount);
+    g_clear_object(&volume);
+    return TRUE;
+}
+
+static void on_volume_monitor_changed(GVolumeMonitor *monitor, GObject *object,
+                                      gpointer data) {
+    (void)monitor;
+    (void)object;
+    refresh_sidebar(data);
+}
+
 static void app_activate(GtkApplication *application, gpointer user_data) {
     App *app = user_data;
     if (app->window != NULL) {
@@ -461,14 +1049,6 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
     g_signal_connect(app->hidden_button, "toggled",
                      G_CALLBACK(on_hidden_toggled), app);
 
-    GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), actions, FALSE, FALSE, 0);
-    add_button(actions, "Copy", "copy", app);
-    add_button(actions, "Move", "move", app);
-    add_button(actions, "Rename", "rename", app);
-    add_button(actions, "Trash", "trash", app);
-    add_button(actions, "Delete", "delete", app);
-
     app->store = gtk_list_store_new(N_COLUMNS, G_TYPE_STRING, G_TYPE_STRING,
                                     G_TYPE_STRING, G_TYPE_FILE);
     app->view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app->store));
@@ -484,12 +1064,59 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
                                          COL_NAME, GTK_SORT_ASCENDING);
     g_signal_connect(app->view, "row-activated",
                      G_CALLBACK(on_row_activated), app);
+
+    app->sidebar_store = gtk_tree_store_new(
+        N_SIDE_COLUMNS, G_TYPE_STRING, G_TYPE_FILE, G_TYPE_VOLUME, G_TYPE_MOUNT,
+        G_TYPE_BOOLEAN);
+    app->sidebar = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(app->sidebar_store));
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(app->sidebar), FALSE);
+    add_text_column(GTK_TREE_VIEW(app->sidebar), "Places", SIDE_NAME, TRUE);
+    g_signal_connect(app->sidebar, "row-expanded",
+                     G_CALLBACK(on_sidebar_row_expanded), app);
+    g_signal_connect(app->sidebar, "row-activated",
+                     G_CALLBACK(on_sidebar_row_activated), app);
+    g_signal_connect(app->sidebar, "button-press-event",
+                     G_CALLBACK(on_sidebar_button_press), app);
+
+    GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(sidebar_scroll), app->sidebar);
+    gtk_widget_set_size_request(sidebar_scroll, 190, -1);
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(outer), paned, TRUE, TRUE, 0);
+    gtk_paned_pack1(GTK_PANED(paned), sidebar_scroll, FALSE, FALSE);
+
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), app->view);
-    gtk_box_pack_start(GTK_BOX(outer), scroll, TRUE, TRUE, 0);
+    gtk_paned_pack2(GTK_PANED(paned), scroll, TRUE, FALSE);
+    g_signal_connect(app->view, "button-press-event",
+                     G_CALLBACK(on_file_button_press), app);
+    g_signal_connect(app->window, "key-press-event",
+                     G_CALLBACK(on_window_key_press), app);
+
+    app->volume_monitor = g_volume_monitor_get();
+    app->volume_added_handler = g_signal_connect(
+        app->volume_monitor, "volume-added",
+        G_CALLBACK(on_volume_monitor_changed), app);
+    app->volume_removed_handler = g_signal_connect(
+        app->volume_monitor, "volume-removed",
+        G_CALLBACK(on_volume_monitor_changed), app);
+    app->mount_added_handler = g_signal_connect(
+        app->volume_monitor, "mount-added",
+        G_CALLBACK(on_volume_monitor_changed), app);
+    app->mount_removed_handler = g_signal_connect(
+        app->volume_monitor, "mount-removed",
+        G_CALLBACK(on_volume_monitor_changed), app);
+    refresh_sidebar(app);
     gtk_widget_show_all(app->window);
+    GtkTreePath *home_path = gtk_tree_path_new_from_indices(0, -1);
+    gtk_tree_view_expand_row(GTK_TREE_VIEW(app->sidebar), home_path, FALSE);
+    gtk_tree_path_free(home_path);
 
     GFile *start = app->history->len != 0
                        ? g_object_ref(g_ptr_array_index(app->history, 0))
@@ -508,8 +1135,28 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
 }
 
 static void app_free(App *app) {
+    if (app->volume_monitor != NULL) {
+        if (app->volume_added_handler != 0) {
+            g_signal_handler_disconnect(app->volume_monitor,
+                                        app->volume_added_handler);
+        }
+        if (app->volume_removed_handler != 0) {
+            g_signal_handler_disconnect(app->volume_monitor,
+                                        app->volume_removed_handler);
+        }
+        if (app->mount_added_handler != 0) {
+            g_signal_handler_disconnect(app->volume_monitor,
+                                        app->mount_added_handler);
+        }
+        if (app->mount_removed_handler != 0) {
+            g_signal_handler_disconnect(app->volume_monitor,
+                                        app->mount_removed_handler);
+        }
+    }
     g_clear_object(&app->location);
     g_clear_object(&app->store);
+    g_clear_object(&app->sidebar_store);
+    g_clear_object(&app->volume_monitor);
     if (app->history != NULL) {
         g_ptr_array_unref(app->history);
     }

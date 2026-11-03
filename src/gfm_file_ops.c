@@ -246,3 +246,33 @@ gboolean gfm_delete(GFile *source, GError **error) {
     g_return_val_if_fail(G_IS_FILE(source), FALSE);
     return delete_node(source, error);
 }
+
+GPtrArray *gfm_parse_uri_list(const gchar *contents, gboolean *move) {
+    g_return_val_if_fail(contents != NULL, NULL);
+    if (move != NULL) {
+        *move = FALSE;
+    }
+    GPtrArray *files = g_ptr_array_new_with_free_func(g_object_unref);
+    gchar **lines = g_strsplit(contents, "\n", -1);
+    guint first_uri = 0;
+    if (g_str_equal(lines[0], "copy") || g_str_equal(lines[0], "cut")) {
+        if (move != NULL) {
+            *move = g_str_equal(lines[0], "cut");
+        }
+        first_uri = 1;
+    }
+    for (guint i = first_uri; lines[i] != NULL; i++) {
+        g_strchomp(lines[i]);
+        if (lines[i][0] == '\0' || lines[i][0] == '#') {
+            continue;
+        }
+        gchar *scheme = g_uri_parse_scheme(lines[i]);
+        if (scheme == NULL) {
+            continue;
+        }
+        g_free(scheme);
+        g_ptr_array_add(files, g_file_new_for_uri(lines[i]));
+    }
+    g_strfreev(lines);
+    return files;
+}
