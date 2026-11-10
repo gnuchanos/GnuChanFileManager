@@ -4,6 +4,15 @@
 #include <sys/stat.h>
 
 static gchar *test_root;
+static guint copy_progress_updates;
+
+static void record_copy_progress(goffset current, goffset total,
+                                gpointer user_data) {
+    (void)user_data;
+    g_assert_cmpint(current, >=, 0);
+    g_assert_cmpint(total, >=, 0);
+    copy_progress_updates++;
+}
 
 static GFile *child(GFile *parent, const gchar *name) {
     GError *error = NULL;
@@ -23,6 +32,71 @@ static void test_safe_names(void) {
     g_assert_false(gfm_name_is_safe("../escape"));
     g_assert_false(gfm_name_is_safe("folder/name"));
     g_assert_false(gfm_name_is_safe("folder\\name"));
+}
+
+static void test_path_or_uri(void) {
+    gchar *path = g_build_filename(test_root, "path with spaces", NULL);
+    GFile *file = g_file_new_for_path(path);
+    gchar *reported_path = gfm_get_path_or_uri(file);
+    g_assert_cmpstr(reported_path, ==, path);
+    g_free(reported_path);
+    g_object_unref(file);
+    g_free(path);
+
+    file = g_file_new_for_uri("sftp://example.invalid/shared/folder");
+    reported_path = gfm_get_path_or_uri(file);
+    g_assert_cmpstr(reported_path, ==,
+                    "sftp://example.invalid/shared/folder");
+    g_free(reported_path);
+    g_object_unref(file);
+}
+
+static void test_create_and_permissions(void) {
+    GError *error = NULL;
+    GFile *parent = g_file_new_for_path(test_root);
+    g_assert_true(gfm_create_directory(parent, "created-folder", &error));
+    g_assert_no_error(error);
+    g_assert_true(gfm_create_file(parent, "created-file.txt", &error));
+    g_assert_no_error(error);
+    g_assert_false(gfm_create_file(parent, "../escape", &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
+    g_clear_error(&error);
+    g_assert_false(gfm_create_directory(parent, "created-folder", &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_EXISTS);
+    g_clear_error(&error);
+
+    GFile *file = child(parent, "created-file.txt");
+    guint32 mode = 0;
+    g_assert_true(gfm_get_permissions(file, &mode, &error));
+    g_assert_no_error(error);
+    guint32 expected_mode = (mode & ~0777U) | ((mode & 0777U) ^ 0040U);
+    if (!gfm_set_permissions(file, expected_mode, &error)) {
+        g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
+        g_clear_error(&error);
+        g_assert_true(gfm_delete(file, &error));
+        g_assert_no_error(error);
+        GFile *directory = child(parent, "created-folder");
+        g_assert_true(gfm_delete(directory, &error));
+        g_assert_no_error(error);
+        g_object_unref(directory);
+        g_object_unref(file);
+        g_object_unref(parent);
+        g_test_skip("the test filesystem does not preserve chmod changes");
+        return;
+    }
+    g_assert_no_error(error);
+    guint32 updated_mode = 0;
+    g_assert_true(gfm_get_permissions(file, &updated_mode, &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(updated_mode & 0777U, ==, expected_mode & 0777U);
+    g_assert_true(gfm_delete(file, &error));
+    g_assert_no_error(error);
+    GFile *directory = child(parent, "created-folder");
+    g_assert_true(gfm_delete(directory, &error));
+    g_assert_no_error(error);
+    g_object_unref(directory);
+    g_object_unref(file);
+    g_object_unref(parent);
 }
 
 static void test_parse_uri_clipboard_data(void) {
@@ -63,8 +137,11 @@ static void test_copy_move_rename_delete(void) {
     GFile *source_dir = g_file_new_for_path(from_path);
     GFile *destination_dir = g_file_new_for_path(to_path);
     GFile *source = child(source_dir, "sample.txt");
-    g_assert_true(gfm_copy_to_directory(source, destination_dir, &error));
+    copy_progress_updates = 0;
+    g_assert_true(gfm_copy_to_directory_full(
+        source, destination_dir, NULL, record_copy_progress, NULL, &error));
     g_assert_no_error(error);
+    g_assert_cmpuint(copy_progress_updates, >, 0);
     GFile *copied = child(destination_dir, "sample.txt");
     g_assert_true(g_file_query_exists(copied, NULL));
 
@@ -121,6 +198,37 @@ static void test_refuse_copy_into_self(void) {
     g_free(parent_path);
 }
 
+static void test_cancelled_copy(void) {
+    GError *error = NULL;
+    gchar *source_path = g_build_filename(test_root, "cancel-source.txt",
+                                          NULL);
+    gchar *destination_path = g_build_filename(test_root, "cancel-destination",
+                                               NULL);
+    g_assert_true(g_file_set_contents(source_path, "cancel me", -1, &error));
+    g_assert_no_error(error);
+    g_assert_cmpint(g_mkdir(destination_path, 0700), ==, 0);
+    GFile *source = g_file_new_for_path(source_path);
+    GFile *destination_directory = g_file_new_for_path(destination_path);
+    GCancellable *cancellable = g_cancellable_new();
+    g_cancellable_cancel(cancellable);
+    g_assert_false(gfm_copy_to_directory_full(
+        source, destination_directory, cancellable, NULL, NULL, &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+    g_clear_error(&error);
+    GFile *destination = child(destination_directory, "cancel-source.txt");
+    g_assert_false(g_file_query_exists(destination, NULL));
+    g_assert_true(gfm_delete(source, &error));
+    g_assert_no_error(error);
+    g_assert_true(gfm_delete(destination_directory, &error));
+    g_assert_no_error(error);
+    g_object_unref(destination);
+    g_object_unref(cancellable);
+    g_object_unref(destination_directory);
+    g_object_unref(source);
+    g_free(destination_path);
+    g_free(source_path);
+}
+
 static void test_failed_directory_copy_removes_partial_tree(void) {
     GError *error = NULL;
     gchar *source_path = g_build_filename(test_root, "source", NULL);
@@ -169,12 +277,16 @@ int main(int argc, char **argv) {
     }
     g_assert_cmpint(g_mkdir_with_parents(test_root, 0700), ==, 0);
     g_test_add_func("/file-ops/safe-names", test_safe_names);
+    g_test_add_func("/file-ops/path-or-uri", test_path_or_uri);
+    g_test_add_func("/file-ops/create-and-permissions",
+                    test_create_and_permissions);
     g_test_add_func("/file-ops/parse-uri-clipboard-data",
                     test_parse_uri_clipboard_data);
     g_test_add_func("/file-ops/copy-move-rename-delete",
                     test_copy_move_rename_delete);
     g_test_add_func("/file-ops/refuse-copy-into-self",
                     test_refuse_copy_into_self);
+    g_test_add_func("/file-ops/cancelled-copy", test_cancelled_copy);
     g_test_add_func("/file-ops/failed-copy-removes-partial-tree",
                     test_failed_directory_copy_removes_partial_tree);
     int result = g_test_run();

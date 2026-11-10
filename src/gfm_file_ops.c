@@ -1,5 +1,7 @@
 #include "gfm_file_ops.h"
 
+#include <errno.h>
+#include <glib/gstdio.h>
 #include <string.h>
 
 gboolean gfm_name_is_safe(const gchar *name) {
@@ -18,15 +20,103 @@ GFile *gfm_child_named(GFile *parent, const gchar *name, GError **error) {
     return g_file_get_child(parent, name);
 }
 
+gchar *gfm_get_path_or_uri(GFile *file) {
+    g_return_val_if_fail(G_IS_FILE(file), NULL);
+    gchar *path = g_file_get_path(file);
+    return path != NULL ? path : g_file_get_uri(file);
+}
+
+gboolean gfm_create_file(GFile *parent, const gchar *name, GError **error) {
+    g_return_val_if_fail(G_IS_FILE(parent), FALSE);
+    GFile *file = gfm_child_named(parent, name, error);
+    if (file == NULL) {
+        return FALSE;
+    }
+    GFileOutputStream *stream = g_file_create(
+        file, G_FILE_CREATE_NONE, NULL, error);
+    gboolean success = stream != NULL;
+    g_clear_object(&stream);
+    g_object_unref(file);
+    return success;
+}
+
+gboolean gfm_create_directory(GFile *parent, const gchar *name,
+                              GError **error) {
+    g_return_val_if_fail(G_IS_FILE(parent), FALSE);
+    GFile *directory = gfm_child_named(parent, name, error);
+    if (directory == NULL) {
+        return FALSE;
+    }
+    gboolean success = g_file_make_directory(directory, NULL, error);
+    g_object_unref(directory);
+    return success;
+}
+
+gboolean gfm_get_permissions(GFile *file, guint32 *mode, GError **error) {
+    g_return_val_if_fail(G_IS_FILE(file), FALSE);
+    g_return_val_if_fail(mode != NULL, FALSE);
+    GFileInfo *info = g_file_query_info(
+        file, G_FILE_ATTRIBUTE_UNIX_MODE, G_FILE_QUERY_INFO_NONE, NULL, error);
+    if (info == NULL) {
+        return FALSE;
+    }
+    if (!g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_MODE)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                            "This location does not expose Unix permissions.");
+        g_object_unref(info);
+        return FALSE;
+    }
+    *mode = g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_MODE);
+    g_object_unref(info);
+    return TRUE;
+}
+
+gboolean gfm_set_permissions(GFile *file, guint32 mode, GError **error) {
+    g_return_val_if_fail(G_IS_FILE(file), FALSE);
+    if (g_file_is_native(file)) {
+        gchar *path = g_file_get_path(file);
+        if (path == NULL) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                                "The native file has no filesystem path.");
+            return FALSE;
+        }
+        if (g_chmod(path, (mode_t)(mode & 07777U)) != 0) {
+            gint saved_errno = errno;
+            g_set_error(error, G_IO_ERROR, g_io_error_from_errno(saved_errno),
+                        "Could not change permissions: %s",
+                        g_strerror(saved_errno));
+            g_free(path);
+            return FALSE;
+        }
+        struct stat status;
+        if (g_stat(path, &status) != 0 ||
+            ((guint32)status.st_mode & 07777U) != (mode & 07777U)) {
+            g_set_error_literal(
+                error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                "The filesystem does not preserve Unix permission changes.");
+            g_free(path);
+            return FALSE;
+        }
+        g_free(path);
+        return TRUE;
+    }
+    return g_file_set_attribute_uint32(
+        file, G_FILE_ATTRIBUTE_UNIX_MODE, mode, G_FILE_QUERY_INFO_NONE, NULL,
+        error);
+}
+
 static gboolean delete_node(GFile *file, GError **error);
 
-static gboolean copy_node(GFile *source, GFile *destination, GError **error) {
+static gboolean copy_node(GFile *source, GFile *destination,
+                          GCancellable *cancellable,
+                          GfmProgressCallback progress_callback,
+                          gpointer progress_data, GError **error) {
     GFileInfo *info = g_file_query_info(
         source,
         G_FILE_ATTRIBUTE_STANDARD_TYPE ","
         G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK ","
         G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
-        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, error);
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
     if (info == NULL) {
         return FALSE;
     }
@@ -38,19 +128,19 @@ static gboolean copy_node(GFile *source, GFile *destination, GError **error) {
             g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                                 "The symbolic link has no target.");
         } else {
-            success = g_file_make_symbolic_link(destination, target, NULL,
-                                                 error);
+            success = g_file_make_symbolic_link(destination, target,
+                                                 cancellable, error);
         }
     } else if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
-        if (g_file_make_directory(destination, NULL, error)) {
+        if (g_file_make_directory(destination, cancellable, error)) {
             GFileEnumerator *enumerator = g_file_enumerate_children(
                 source, G_FILE_ATTRIBUTE_STANDARD_NAME,
-                G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, error);
+                G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
             if (enumerator != NULL) {
                 success = TRUE;
                 GFileInfo *child_info;
                 while ((child_info = g_file_enumerator_next_file(
-                            enumerator, NULL, error)) != NULL) {
+                            enumerator, cancellable, error)) != NULL) {
                     const gchar *child_name =
                         g_file_info_get_name(child_info);
                     GFile *source_child =
@@ -60,7 +150,9 @@ static gboolean copy_node(GFile *source, GFile *destination, GError **error) {
                             ? gfm_child_named(destination, child_name, error)
                             : NULL;
                     if (source_child == NULL || destination_child == NULL ||
-                        !copy_node(source_child, destination_child, error)) {
+                        !copy_node(source_child, destination_child,
+                                   cancellable, progress_callback,
+                                   progress_data, error)) {
                         success = FALSE;
                         g_clear_object(&source_child);
                         g_clear_object(&destination_child);
@@ -83,8 +175,9 @@ static gboolean copy_node(GFile *source, GFile *destination, GError **error) {
             }
         }
     } else {
-        success = g_file_copy(source, destination, G_FILE_COPY_NONE, NULL,
-                              NULL, NULL, error);
+        success = g_file_copy(source, destination, G_FILE_COPY_NONE,
+                              cancellable, progress_callback, progress_data,
+                              error);
     }
 
     g_object_unref(info);
@@ -142,6 +235,14 @@ static GFile *destination_for_source(GFile *source,
 
 gboolean gfm_copy_to_directory(GFile *source, GFile *destination_directory,
                                GError **error) {
+    return gfm_copy_to_directory_full(source, destination_directory, NULL,
+                                      NULL, NULL, error);
+}
+
+gboolean gfm_copy_to_directory_full(
+    GFile *source, GFile *destination_directory, GCancellable *cancellable,
+    GfmProgressCallback progress_callback, gpointer progress_data,
+    GError **error) {
     g_return_val_if_fail(G_IS_FILE(source), FALSE);
     g_return_val_if_fail(G_IS_FILE(destination_directory), FALSE);
     GFile *destination =
@@ -149,7 +250,8 @@ gboolean gfm_copy_to_directory(GFile *source, GFile *destination_directory,
     if (destination == NULL) {
         return FALSE;
     }
-    gboolean success = copy_node(source, destination, error);
+    gboolean success = copy_node(source, destination, cancellable,
+                                 progress_callback, progress_data, error);
     g_object_unref(destination);
     return success;
 }

@@ -1,11 +1,13 @@
 #include "gfm_file_ops.h"
 
 #include <gtk/gtk.h>
+#include <glib/gstdio.h>
+#include <sys/stat.h>
 #include <string.h>
 
 #define APP_ID "org.gnuchan.GnuChanFileManager"
 
-enum { COL_NAME, COL_TYPE, COL_SIZE, COL_FILE, N_COLUMNS };
+enum { COL_NAME, COL_TYPE, COL_SIZE, COL_FILE, COL_PREVIEW, N_COLUMNS };
 enum {
     SIDE_NAME,
     SIDE_FILE,
@@ -21,6 +23,18 @@ typedef struct {
 } ClipboardFile;
 
 typedef struct {
+    GFile *source;
+    GFile *destination_directory;
+} CopyJob;
+
+typedef struct {
+    GtkListStore *store;
+    GtkTreeRowReference *row;
+    GFile *file;
+    gchar *cache_path;
+} VideoThumbnailRequest;
+
+typedef struct {
     GtkApplication *application;
     GtkWidget *window;
     GtkWidget *address;
@@ -30,16 +44,37 @@ typedef struct {
     GtkWidget *up_button;
     GtkWidget *hidden_button;
     GtkWidget *view;
+    GtkWidget *icon_view;
+    GtkWidget *view_stack;
     GtkListStore *store;
     GtkWidget *sidebar;
     GtkTreeStore *sidebar_store;
     GVolumeMonitor *volume_monitor;
     GFile *location;
     GPtrArray *history;
+    GPtrArray *bookmarks;
+    GPtrArray *recent_locations;
     guint history_index;
     gboolean show_hidden;
+    gboolean icon_mode;
     gchar *config_path;
     gchar *start_location;
+    GQueue *copy_queue;
+    GThread *copy_thread;
+    GCancellable *copy_cancellable;
+    GMutex copy_mutex;
+    GCond copy_condition;
+    GtkWidget *copy_window;
+    GtkWidget *copy_label;
+    GtkWidget *copy_progress;
+    GtkWidget *copy_pause_button;
+    gchar *copy_current_path;
+    gchar *copy_error;
+    gdouble copy_fraction;
+    guint copy_timer;
+    gboolean copy_running;
+    gboolean copy_paused;
+    gboolean shutting_down;
     gulong volume_added_handler;
     gulong volume_removed_handler;
     gulong mount_added_handler;
@@ -51,6 +86,9 @@ static void on_forward(GtkButton *button, gpointer data);
 static void on_up(GtkButton *button, gpointer data);
 static void on_volume_mounted(GObject *source, GAsyncResult *result,
                               gpointer data);
+static void queue_copy(App *app, GFile *source, GFile *destination_directory);
+static void refresh_sidebar(App *app);
+static void open_selected(App *app);
 
 static void show_error(App *app, const gchar *summary, GError *error) {
     GtkWidget *dialog = gtk_message_dialog_new(
@@ -104,6 +142,232 @@ static gboolean is_hidden_name(const gchar *name) {
     return name != NULL && name[0] == '.';
 }
 
+static gchar *video_thumbnail_cache_path(GFile *file) {
+    gchar *uri = g_file_get_uri(file);
+    gchar *digest = g_compute_checksum_for_string(G_CHECKSUM_MD5, uri, -1);
+    gchar *filename = g_strdup_printf("%s/thumbnails/normal/%s.png",
+                                      g_get_user_cache_dir(), digest);
+    g_free(digest);
+    g_free(uri);
+    return filename;
+}
+
+static GdkPixbuf *scale_preview(GdkPixbuf *source) {
+    gint width = gdk_pixbuf_get_width(source);
+    gint height = gdk_pixbuf_get_height(source);
+    gdouble scale = MIN(32.0 / width, 32.0 / height);
+    gint preview_width = MAX(1, (gint)(width * scale));
+    gint preview_height = MAX(1, (gint)(height * scale));
+    return gdk_pixbuf_scale_simple(source, preview_width, preview_height,
+                                   GDK_INTERP_BILINEAR);
+}
+
+static void video_thumbnail_request_free(gpointer data) {
+    VideoThumbnailRequest *request = data;
+    g_clear_object(&request->store);
+    if (request->row != NULL) {
+        gtk_tree_row_reference_free(request->row);
+    }
+    g_clear_object(&request->file);
+    g_free(request->cache_path);
+    g_free(request);
+}
+
+static void video_thumbnail_worker(GTask *task, gpointer source_object,
+                                   gpointer task_data,
+                                   GCancellable *cancellable) {
+    (void)source_object;
+    VideoThumbnailRequest *request = task_data;
+    gchar *program = g_find_program_in_path("ffmpeg");
+    gchar *path = g_file_get_path(request->file);
+    if (program == NULL || path == NULL) {
+        g_free(program);
+        g_free(path);
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                                "No video thumbnailer is available.");
+        return;
+    }
+
+    GFileInfo *info = g_file_query_info(
+        request->file,
+        G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_TIME_MODIFIED,
+        G_FILE_QUERY_INFO_NONE, cancellable, NULL);
+    gchar *modified = g_strdup_printf("%" G_GUINT64_FORMAT,
+                                      info != NULL
+                                          ? g_file_info_get_attribute_uint64(
+                                                info,
+                                                G_FILE_ATTRIBUTE_TIME_MODIFIED)
+                                          : 0);
+    gchar *size = g_strdup_printf(
+        "%" G_GUINT64_FORMAT,
+        info != NULL ? g_file_info_get_size(info) : 0);
+    gchar *arguments[] = {
+        program, "-nostdin", "-v", "error", "-ss", "1", "-i", path,
+        "-frames:v", "1", "-vf",
+        "scale=96:96:force_original_aspect_ratio=decrease", "-f",
+        "image2pipe", "-vcodec", "png", "pipe:1", NULL
+    };
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_newv(
+        (const gchar *const *)arguments, G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    GBytes *output = NULL;
+    if (process != NULL &&
+        g_subprocess_communicate(process, NULL, cancellable, &output, NULL,
+                                 &error) &&
+        g_subprocess_get_successful(process)) {
+        gsize output_size = 0;
+        gconstpointer output_data = g_bytes_get_data(output, &output_size);
+        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+        if (gdk_pixbuf_loader_write(loader, output_data, output_size, &error) &&
+            gdk_pixbuf_loader_close(loader, &error)) {
+            GdkPixbuf *pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+            if (pixbuf != NULL) {
+                GdkPixbuf *thumbnail = scale_preview(pixbuf);
+                gchar *cache_directory = g_path_get_dirname(
+                    request->cache_path);
+                g_mkdir_with_parents(cache_directory, 0700);
+                gchar *keys[] = {"tEXt::Thumb::URI", "tEXt::Thumb::MTime",
+                                 "tEXt::Thumb::Size", NULL};
+                gchar *values[] = {NULL, modified, size, NULL};
+                values[0] = g_file_get_uri(request->file);
+                gdk_pixbuf_savev(thumbnail, request->cache_path, "png", keys,
+                                 values, NULL);
+                g_free(values[0]);
+                g_free(cache_directory);
+                g_bytes_unref(output);
+                g_object_unref(loader);
+                g_object_unref(process);
+                g_clear_object(&info);
+                g_free(modified);
+                g_free(size);
+                g_free(program);
+                g_free(path);
+                g_task_return_pointer(task, thumbnail, g_object_unref);
+                return;
+            }
+        }
+        g_object_unref(loader);
+    }
+    if (error == NULL) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Could not generate a video thumbnail.");
+    }
+    g_clear_pointer(&output, g_bytes_unref);
+    g_clear_object(&process);
+    g_clear_object(&info);
+    g_free(modified);
+    g_free(size);
+    g_free(program);
+    g_free(path);
+    g_task_return_error(task, error);
+}
+
+static void video_thumbnail_ready(GObject *source_object, GAsyncResult *result,
+                                  gpointer user_data) {
+    (void)source_object;
+    VideoThumbnailRequest *request = user_data;
+    GdkPixbuf *thumbnail = g_task_propagate_pointer(G_TASK(result), NULL);
+    if (thumbnail != NULL) {
+        GtkTreePath *path = gtk_tree_row_reference_get_path(request->row);
+        if (path != NULL) {
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(GTK_TREE_MODEL(request->store), &iter,
+                                        path)) {
+                gtk_list_store_set(request->store, &iter, COL_PREVIEW,
+                                   thumbnail, -1);
+            }
+            gtk_tree_path_free(path);
+        }
+        g_object_unref(thumbnail);
+    }
+}
+
+static void schedule_video_thumbnail(GtkListStore *store, GFile *file,
+                                     GtkTreeIter *iter) {
+    VideoThumbnailRequest *request = g_new0(VideoThumbnailRequest, 1);
+    request->store = g_object_ref(store);
+    request->file = g_object_ref(file);
+    request->cache_path = video_thumbnail_cache_path(file);
+    GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), iter);
+    request->row = gtk_tree_row_reference_new(GTK_TREE_MODEL(store), path);
+    gtk_tree_path_free(path);
+    GTask *task = g_task_new(NULL, NULL, video_thumbnail_ready, request);
+    g_task_set_task_data(task, request, video_thumbnail_request_free);
+    g_task_run_in_thread(task, video_thumbnail_worker);
+    g_object_unref(task);
+}
+
+static GdkPixbuf *load_video_thumbnail(GFile *file, GFileInfo *info,
+                                       gboolean *needs_generation) {
+    gchar *filename = video_thumbnail_cache_path(file);
+    GdkPixbuf *thumbnail = NULL;
+    if (g_file_test(filename, G_FILE_TEST_IS_REGULAR)) {
+        gchar *uri = g_file_get_uri(file);
+        gchar *modified = g_strdup_printf(
+            "%" G_GUINT64_FORMAT,
+            g_file_info_get_attribute_uint64(
+                info, G_FILE_ATTRIBUTE_TIME_MODIFIED));
+        GdkPixbuf *cached = gdk_pixbuf_new_from_file(filename, NULL);
+        const gchar *cached_uri = cached != NULL
+                                      ? gdk_pixbuf_get_option(
+                                            cached, "tEXt::Thumb::URI")
+                                      : NULL;
+        const gchar *cached_modified =
+            cached != NULL
+                ? gdk_pixbuf_get_option(cached, "tEXt::Thumb::MTime")
+                : NULL;
+        if (cached != NULL && g_strcmp0(cached_uri, uri) == 0 &&
+            g_strcmp0(cached_modified, modified) == 0) {
+            thumbnail = scale_preview(cached);
+        }
+        g_clear_object(&cached);
+        g_free(modified);
+        g_free(uri);
+    }
+    if (thumbnail == NULL) {
+        *needs_generation = TRUE;
+        thumbnail = gtk_icon_theme_load_icon(
+            gtk_icon_theme_get_default(), "video-x-generic", 32,
+            GTK_ICON_LOOKUP_USE_BUILTIN, NULL);
+    }
+    g_free(filename);
+    return thumbnail;
+}
+
+static GdkPixbuf *load_file_preview(GFile *file, GFileInfo *info,
+                                    gboolean *needs_video_thumbnail) {
+    *needs_video_thumbnail = FALSE;
+    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR) {
+        return NULL;
+    }
+    const gchar *content_type = g_file_info_get_content_type(info);
+    if (content_type == NULL) {
+        return NULL;
+    }
+    if (g_str_has_prefix(content_type, "image/")) {
+        gchar *path = g_file_get_path(file);
+        GdkPixbuf *preview = NULL;
+        if (path != NULL) {
+            preview = gdk_pixbuf_new_from_file_at_scale(path, 32, 32, TRUE,
+                                                        NULL);
+        } else {
+            GFileInputStream *stream = g_file_read(file, NULL, NULL);
+            if (stream != NULL) {
+                preview = gdk_pixbuf_new_from_stream_at_scale(
+                    G_INPUT_STREAM(stream), 32, 32, TRUE, NULL, NULL);
+                g_object_unref(stream);
+            }
+        }
+        g_free(path);
+        return preview;
+    }
+    if (g_str_has_prefix(content_type, "video/")) {
+        return load_video_thumbnail(file, info, needs_video_thumbnail);
+    }
+    return NULL;
+}
+
 static void update_navigation(App *app) {
     gtk_widget_set_sensitive(app->back_button, app->history_index > 0);
     gtk_widget_set_sensitive(app->forward_button,
@@ -117,8 +381,26 @@ static void save_config(App *app) {
     GKeyFile *key_file = g_key_file_new();
     g_key_file_set_boolean(key_file, "General", "show_hidden",
                            app->show_hidden);
+    g_key_file_set_boolean(key_file, "General", "icon_mode",
+                           app->icon_mode);
     g_key_file_set_string(key_file, "General", "start_location",
                           app->start_location);
+    GPtrArray *lists[] = {app->bookmarks, app->recent_locations};
+    const gchar *keys[] = {"bookmarks", "recent_locations"};
+    for (guint list_index = 0; list_index < G_N_ELEMENTS(lists);
+         list_index++) {
+        GPtrArray *items = lists[list_index];
+        if (items == NULL || items->len == 0) {
+            continue;
+        }
+        gchar **paths = g_new0(gchar *, items->len);
+        for (guint i = 0; i < items->len; i++) {
+            paths[i] = gfm_get_path_or_uri(g_ptr_array_index(items, i));
+        }
+        g_key_file_set_string_list(key_file, "General", keys[list_index],
+                                   (const gchar *const *)paths, items->len);
+        g_strfreev(paths);
+    }
     gchar *data = g_key_file_to_data(key_file, NULL, NULL);
     gchar *directory = g_path_get_dirname(app->config_path);
     g_mkdir_with_parents(directory, 0700);
@@ -132,6 +414,80 @@ static void save_config(App *app) {
     g_key_file_unref(key_file);
 }
 
+static void add_unique_file(GPtrArray *files, GFile *file, guint maximum) {
+    for (guint i = 0; i < files->len; i++) {
+        if (g_file_equal(g_ptr_array_index(files, i), file)) {
+            g_ptr_array_remove_index(files, i);
+            break;
+        }
+    }
+    g_ptr_array_insert(files, 0, g_object_ref(file));
+    while (files->len > maximum) {
+        g_ptr_array_remove_index(files, files->len - 1);
+    }
+}
+
+static void remember_location(App *app, GFile *file) {
+    if (app->recent_locations == NULL) {
+        return;
+    }
+    add_unique_file(app->recent_locations, file, 10);
+    save_config(app);
+    if (app->sidebar_store != NULL) {
+        GtkTreeIter group;
+        gboolean valid = gtk_tree_model_get_iter_first(
+            GTK_TREE_MODEL(app->sidebar_store), &group);
+        while (valid) {
+            gchar *name = NULL;
+            gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &group,
+                               SIDE_NAME, &name, -1);
+            gboolean recent_group = g_strcmp0(name, "Recent Locations") == 0;
+            g_free(name);
+            if (recent_group) {
+                GtkTreeIter child;
+                while (gtk_tree_model_iter_children(
+                           GTK_TREE_MODEL(app->sidebar_store), &child,
+                           &group)) {
+                    gtk_tree_store_remove(app->sidebar_store, &child);
+                }
+                for (guint i = 0; i < app->recent_locations->len; i++) {
+                    GFile *recent = g_ptr_array_index(app->recent_locations, i);
+                    gchar *basename = g_file_get_basename(recent);
+                    if (basename == NULL) {
+                        basename = gfm_get_path_or_uri(recent);
+                    }
+                    GtkTreeIter shortcut;
+                    gtk_tree_store_append(app->sidebar_store, &shortcut,
+                                          &group);
+                    gtk_tree_store_set(app->sidebar_store, &shortcut,
+                                       SIDE_NAME, basename, SIDE_FILE, recent,
+                                       SIDE_LOADED, TRUE, -1);
+                    g_free(basename);
+                }
+                break;
+            }
+            valid = gtk_tree_model_iter_next(
+                GTK_TREE_MODEL(app->sidebar_store), &group);
+        }
+    }
+}
+
+static void load_file_list(GKeyFile *key_file, const gchar *key,
+                           GPtrArray *files, guint maximum) {
+    gsize length = 0;
+    gchar **paths = g_key_file_get_string_list(
+        key_file, "General", key, &length, NULL);
+    for (gsize i = 0; paths != NULL && i < length && files->len < maximum;
+         i++) {
+        GFile *file = file_from_address(paths[i], NULL);
+        if (file != NULL && g_file_query_exists(file, NULL)) {
+            add_unique_file(files, file, maximum);
+        }
+        g_clear_object(&file);
+    }
+    g_strfreev(paths);
+}
+
 static void refresh_listing(App *app) {
     gtk_list_store_clear(app->store);
     GError *error = NULL;
@@ -139,7 +495,9 @@ static void refresh_listing(App *app) {
         app->location,
         G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE ","
         G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN ","
-        G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK,
+        G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK ","
+        G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE ","
+        G_FILE_ATTRIBUTE_TIME_MODIFIED,
         G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
     if (enumerator == NULL) {
         show_error(app, "Could not read this location.", error);
@@ -149,6 +507,7 @@ static void refresh_listing(App *app) {
 
     gchar *query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(app->search)),
                                    -1);
+    guint video_thumbnail_jobs = 0;
     GFileInfo *info;
     while ((info = g_file_enumerator_next_file(enumerator, NULL, &error)) !=
            NULL) {
@@ -166,6 +525,9 @@ static void refresh_listing(App *app) {
             GFile *file = g_file_get_child(app->location, name);
             GFileType type = g_file_info_get_file_type(info);
             gboolean directory = type == G_FILE_TYPE_DIRECTORY;
+            gboolean needs_video_thumbnail = FALSE;
+            GdkPixbuf *preview = load_file_preview(
+                file, info, &needs_video_thumbnail);
             const gchar *type_name = directory ? "Folder" :
                                      type == G_FILE_TYPE_SYMBOLIC_LINK ? "Link" :
                                      type == G_FILE_TYPE_REGULAR ? "File" :
@@ -174,7 +536,13 @@ static void refresh_listing(App *app) {
             GtkTreeIter iter;
             gtk_list_store_append(app->store, &iter);
             gtk_list_store_set(app->store, &iter, COL_NAME, name, COL_TYPE,
-                               type_name, COL_SIZE, size, COL_FILE, file, -1);
+                               type_name, COL_SIZE, size, COL_FILE, file,
+                               COL_PREVIEW, preview, -1);
+            if (needs_video_thumbnail && video_thumbnail_jobs < 12) {
+                schedule_video_thumbnail(app->store, file, &iter);
+                video_thumbnail_jobs++;
+            }
+            g_clear_object(&preview);
             g_free(size);
             g_object_unref(file);
         }
@@ -222,6 +590,7 @@ static gboolean go_to(App *app, GFile *file, gboolean add_history) {
     gtk_entry_set_text(GTK_ENTRY(app->address), path);
     g_free(path);
     refresh_listing(app);
+    remember_location(app, file);
     return TRUE;
 }
 
@@ -255,17 +624,235 @@ static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
     g_object_unref(file);
 }
 
+static void on_icon_item_activated(GtkIconView *view, GtkTreePath *path,
+                                   gpointer data) {
+    App *app = data;
+    gtk_icon_view_unselect_all(view);
+    gtk_icon_view_select_path(view, path);
+    open_selected(app);
+}
+
 static GFile *selected_file(App *app) {
-    GtkTreeSelection *selection = gtk_tree_view_get_selection(
-        GTK_TREE_VIEW(app->view));
     GtkTreeModel *model = NULL;
     GtkTreeIter iter;
-    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
-        return NULL;
+    if (gtk_stack_get_visible_child(GTK_STACK(app->view_stack)) ==
+        app->icon_view) {
+        GList *selected = gtk_icon_view_get_selected_items(
+            GTK_ICON_VIEW(app->icon_view));
+        if (selected == NULL) {
+            return NULL;
+        }
+        model = GTK_TREE_MODEL(app->store);
+        gboolean found = gtk_tree_model_get_iter(
+            model, &iter, selected->data);
+        g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+        if (!found) {
+            return NULL;
+        }
+    } else {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(
+            GTK_TREE_VIEW(app->view));
+        if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
+            return NULL;
+        }
     }
     GFile *file = NULL;
     gtk_tree_model_get(model, &iter, COL_FILE, &file, -1);
     return file;
+}
+
+static void copy_job_free(gpointer data) {
+    CopyJob *job = data;
+    g_clear_object(&job->source);
+    g_clear_object(&job->destination_directory);
+    g_free(job);
+}
+
+static void copy_progress_changed(goffset current, goffset total,
+                                  gpointer user_data) {
+    App *app = user_data;
+    g_mutex_lock(&app->copy_mutex);
+    while (app->copy_paused && !app->shutting_down) {
+        g_cond_wait(&app->copy_condition, &app->copy_mutex);
+    }
+    if (total > 0) {
+        app->copy_fraction = CLAMP((gdouble)current / (gdouble)total, 0.0, 1.0);
+    } else {
+        app->copy_fraction = 0.0;
+    }
+    g_mutex_unlock(&app->copy_mutex);
+}
+
+static gpointer copy_worker(gpointer user_data) {
+    App *app = user_data;
+    for (;;) {
+        g_mutex_lock(&app->copy_mutex);
+        while (g_queue_is_empty(app->copy_queue) && !app->shutting_down) {
+            g_cond_wait(&app->copy_condition, &app->copy_mutex);
+        }
+        if (app->shutting_down) {
+            g_mutex_unlock(&app->copy_mutex);
+            break;
+        }
+        CopyJob *job = g_queue_pop_head(app->copy_queue);
+        g_free(app->copy_current_path);
+        app->copy_current_path = gfm_get_path_or_uri(job->source);
+        app->copy_fraction = 0.0;
+        g_mutex_unlock(&app->copy_mutex);
+
+        GError *error = NULL;
+        gfm_copy_to_directory_full(
+            job->source, job->destination_directory, app->copy_cancellable,
+            copy_progress_changed, app, &error);
+        if (error != NULL) {
+            g_mutex_lock(&app->copy_mutex);
+            if (app->copy_error == NULL) {
+                app->copy_error = g_strdup(error->message);
+            }
+            g_mutex_unlock(&app->copy_mutex);
+            g_error_free(error);
+        }
+        copy_job_free(job);
+        g_mutex_lock(&app->copy_mutex);
+        if (g_queue_is_empty(app->copy_queue)) {
+            app->copy_running = FALSE;
+            app->copy_paused = FALSE;
+        }
+        g_mutex_unlock(&app->copy_mutex);
+    }
+    return NULL;
+}
+
+static gboolean on_copy_window_delete(GtkWidget *widget, GdkEvent *event,
+                                      gpointer user_data) {
+    (void)event;
+    (void)user_data;
+    gtk_widget_hide(widget);
+    return TRUE;
+}
+
+static void on_copy_pause_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    App *app = user_data;
+    g_mutex_lock(&app->copy_mutex);
+    gboolean running = app->copy_running;
+    if (running) {
+        app->copy_paused = !app->copy_paused;
+        g_cond_broadcast(&app->copy_condition);
+    }
+    gboolean paused = app->copy_paused;
+    g_mutex_unlock(&app->copy_mutex);
+    if (!running) {
+        if (app->copy_timer != 0) {
+            g_source_remove(app->copy_timer);
+            app->copy_timer = 0;
+        }
+        gtk_widget_destroy(app->copy_window);
+        app->copy_window = NULL;
+        app->copy_label = NULL;
+        app->copy_progress = NULL;
+        app->copy_pause_button = NULL;
+    } else {
+        gtk_button_set_label(GTK_BUTTON(app->copy_pause_button),
+                             paused ? "Resume" : "Pause");
+    }
+}
+
+static gboolean update_copy_window(gpointer user_data) {
+    App *app = user_data;
+    g_mutex_lock(&app->copy_mutex);
+    gboolean running = app->copy_running;
+    gboolean paused = app->copy_paused;
+    guint queued = g_queue_get_length(app->copy_queue);
+    gdouble fraction = app->copy_fraction;
+    gchar *current_path = g_strdup(app->copy_current_path);
+    gchar *error = !running ? g_steal_pointer(&app->copy_error) : NULL;
+    g_mutex_unlock(&app->copy_mutex);
+
+    if (!running) {
+        gtk_label_set_text(GTK_LABEL(app->copy_label),
+                           error == NULL ? "All queued copies complete."
+                                         : "Copy queue finished with errors.");
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->copy_progress),
+                                      error == NULL ? 1.0 : fraction);
+        gtk_button_set_label(GTK_BUTTON(app->copy_pause_button), "Close");
+        if (app->window != NULL) {
+            refresh_listing(app);
+        }
+        if (error != NULL) {
+            GError *copy_error = g_error_new_literal(
+                G_IO_ERROR, G_IO_ERROR_FAILED, error);
+            show_error(app, "One or more copies failed.", copy_error);
+            g_error_free(copy_error);
+            g_free(error);
+        }
+        g_free(current_path);
+        app->copy_timer = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    gchar *basename = current_path != NULL
+                          ? g_path_get_basename(current_path)
+                          : g_strdup("item");
+    gchar *label = queued > 0
+                       ? g_strdup_printf("%s %s (%u queued)",
+                                         paused ? "Paused:" : "Copying",
+                                         basename, queued)
+                       : g_strdup_printf("%s %s",
+                                         paused ? "Paused:" : "Copying",
+                                         basename);
+    gtk_label_set_text(GTK_LABEL(app->copy_label), label);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->copy_progress),
+                                  fraction);
+    gtk_button_set_label(GTK_BUTTON(app->copy_pause_button),
+                         paused ? "Resume" : "Pause");
+    g_free(label);
+    g_free(basename);
+    g_free(current_path);
+    return G_SOURCE_CONTINUE;
+}
+
+static void show_copy_window(App *app) {
+    if (app->copy_window == NULL) {
+        app->copy_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(app->copy_window), "Copy Progress");
+        gtk_window_set_transient_for(GTK_WINDOW(app->copy_window),
+                                     GTK_WINDOW(app->window));
+        gtk_window_set_default_size(GTK_WINDOW(app->copy_window), 360, -1);
+        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+        gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+        gtk_container_add(GTK_CONTAINER(app->copy_window), box);
+        app->copy_label = gtk_label_new("Preparing queued copies…");
+        gtk_label_set_xalign(GTK_LABEL(app->copy_label), 0.0f);
+        gtk_box_pack_start(GTK_BOX(box), app->copy_label, FALSE, FALSE, 0);
+        app->copy_progress = gtk_progress_bar_new();
+        gtk_box_pack_start(GTK_BOX(box), app->copy_progress, FALSE, FALSE, 0);
+        app->copy_pause_button = gtk_button_new_with_label("Pause");
+        gtk_widget_set_halign(app->copy_pause_button, GTK_ALIGN_END);
+        gtk_box_pack_start(GTK_BOX(box), app->copy_pause_button, FALSE, FALSE,
+                           0);
+        g_signal_connect(app->copy_pause_button, "clicked",
+                         G_CALLBACK(on_copy_pause_clicked), app);
+        g_signal_connect(app->copy_window, "delete-event",
+                         G_CALLBACK(on_copy_window_delete), app);
+    }
+    gtk_widget_show_all(app->copy_window);
+    gtk_window_present(GTK_WINDOW(app->copy_window));
+    if (app->copy_timer == 0) {
+        app->copy_timer = g_timeout_add(100, update_copy_window, app);
+    }
+}
+
+static void queue_copy(App *app, GFile *source, GFile *destination_directory) {
+    CopyJob *job = g_new0(CopyJob, 1);
+    job->source = g_object_ref(source);
+    job->destination_directory = g_object_ref(destination_directory);
+    g_mutex_lock(&app->copy_mutex);
+    g_queue_push_tail(app->copy_queue, job);
+    app->copy_running = TRUE;
+    g_cond_signal(&app->copy_condition);
+    g_mutex_unlock(&app->copy_mutex);
+    show_copy_window(app);
 }
 
 static gint ask_confirm(App *app, const gchar *message, const gchar *detail) {
@@ -303,6 +890,144 @@ static gchar *ask_text(App *app, const gchar *title, const gchar *prompt,
     return result;
 }
 
+static void create_item(App *app, gboolean directory) {
+    gchar *name = ask_text(app, directory ? "New Folder" : "New File",
+                           directory ? "Folder name:" : "File name:", NULL);
+    if (name == NULL) {
+        return;
+    }
+    GError *error = NULL;
+    gboolean success = directory
+                           ? gfm_create_directory(app->location, name, &error)
+                           : gfm_create_file(app->location, name, &error);
+    if (!success) {
+        show_error(app, directory ? "Could not create folder."
+                                  : "Could not create file.",
+                   error);
+        g_clear_error(&error);
+    } else {
+        refresh_listing(app);
+    }
+    g_free(name);
+}
+
+static void show_properties(App *app, GFile *file) {
+    GError *error = NULL;
+    GFileInfo *info = g_file_query_info(
+        file, G_FILE_ATTRIBUTE_STANDARD_TYPE ","
+             G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+             G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE ","
+             G_FILE_ATTRIBUTE_TIME_MODIFIED ","
+             G_FILE_ATTRIBUTE_UNIX_MODE,
+        G_FILE_QUERY_INFO_NONE, NULL, &error);
+    if (info == NULL) {
+        show_error(app, "Could not read item properties.", error);
+        g_clear_error(&error);
+        return;
+    }
+
+    gchar *path = gfm_get_path_or_uri(file);
+    const gchar *content_type = g_file_info_get_content_type(info);
+    gchar *type = content_type != NULL
+                      ? g_content_type_get_description(content_type)
+                      : NULL;
+    if (type == NULL) {
+        type = g_strdup(g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY
+                            ? "Folder"
+                            : "File");
+    }
+    gchar *size = g_format_size(g_file_info_get_size(info));
+    GDateTime *modified = g_date_time_new_from_unix_local(
+        (gint64)g_file_info_get_attribute_uint64(
+            info, G_FILE_ATTRIBUTE_TIME_MODIFIED));
+    gchar *modified_text = modified != NULL
+                               ? g_date_time_format(modified, "%c")
+                               : g_strdup("Unknown");
+    gchar *details = g_strdup_printf(
+        "Location: %s\nType: %s\nSize: %s\nModified: %s",
+        path, type, size, modified_text);
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Properties", GTK_WINDOW(app->window), GTK_DIALOG_MODAL,
+        "_Close", GTK_RESPONSE_CLOSE, "_Apply Permissions",
+        GTK_RESPONSE_ACCEPT, NULL);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    gtk_box_pack_start(GTK_BOX(content), box, TRUE, TRUE, 0);
+    GtkWidget *label = gtk_label_new(details);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_box_pack_start(GTK_BOX(box), grid, FALSE, FALSE, 0);
+    const gchar *classes[] = {"Owner", "Group", "Other"};
+    const gchar *permissions[] = {"Read", "Write", "Execute"};
+    const guint32 bits[][3] = {
+        {S_IRUSR, S_IWUSR, S_IXUSR},
+        {S_IRGRP, S_IWGRP, S_IXGRP},
+        {S_IROTH, S_IWOTH, S_IXOTH}
+    };
+    GtkWidget *checks[3][3] = {{NULL}};
+    guint32 mode = g_file_info_get_attribute_uint32(
+        info, G_FILE_ATTRIBUTE_UNIX_MODE);
+    for (guint column = 0; column < 3; column++) {
+        GtkWidget *heading = gtk_label_new(classes[column]);
+        gtk_grid_attach(GTK_GRID(grid), heading, (gint)column + 1, 0, 1, 1);
+    }
+    for (guint row = 0; row < 3; row++) {
+        GtkWidget *heading = gtk_label_new(permissions[row]);
+        gtk_widget_set_halign(heading, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(grid), heading, 0, (gint)row + 1, 1, 1);
+        for (guint column = 0; column < 3; column++) {
+            checks[row][column] = gtk_check_button_new();
+            gtk_toggle_button_set_active(
+                GTK_TOGGLE_BUTTON(checks[row][column]),
+                (mode & bits[column][row]) != 0);
+            gtk_grid_attach(GTK_GRID(grid), checks[row][column],
+                            (gint)column + 1, (gint)row + 1, 1, 1);
+        }
+    }
+    gboolean supports_permissions = g_file_info_has_attribute(
+        info, G_FILE_ATTRIBUTE_UNIX_MODE);
+    gtk_widget_set_sensitive(grid, supports_permissions);
+    if (!supports_permissions) {
+        GtkWidget *notice = gtk_label_new(
+            "This location does not expose editable Unix permissions.");
+        gtk_box_pack_start(GTK_BOX(box), notice, FALSE, FALSE, 0);
+        gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT,
+                                          FALSE);
+    }
+    gtk_widget_show_all(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        guint32 updated_mode = mode & ~0777U;
+        for (guint column = 0; column < 3; column++) {
+            for (guint row = 0; row < 3; row++) {
+                if (gtk_toggle_button_get_active(
+                        GTK_TOGGLE_BUTTON(checks[row][column]))) {
+                    updated_mode |= bits[column][row];
+                }
+            }
+        }
+        if (!gfm_set_permissions(file, updated_mode, &error)) {
+            show_error(app, "Could not update permissions.", error);
+            g_clear_error(&error);
+        } else {
+            refresh_listing(app);
+        }
+    }
+    gtk_widget_destroy(dialog);
+    g_free(path);
+    g_free(type);
+    g_free(size);
+    g_free(modified_text);
+    g_free(details);
+    g_clear_pointer(&modified, g_date_time_unref);
+    g_object_unref(info);
+}
+
 static void do_operation(App *app, const gchar *operation) {
     GFile *source = selected_file(app);
     if (source == NULL) {
@@ -335,9 +1060,13 @@ static void do_operation(App *app, const gchar *operation) {
             if (ask_confirm(app, g_str_equal(operation, "copy") ?
                                 "Copy selected item?" : "Move selected item?",
                             path) == GTK_RESPONSE_ACCEPT) {
-                success = g_str_equal(operation, "copy")
-                              ? gfm_copy_to_directory(source, destination, &error)
-                              : gfm_move_to_directory(source, destination, &error);
+                if (g_str_equal(operation, "copy")) {
+                    queue_copy(app, source, destination);
+                    success = TRUE;
+                } else {
+                    success = gfm_move_to_directory(source, destination,
+                                                    &error);
+                }
             }
             g_object_unref(destination);
         }
@@ -427,13 +1156,14 @@ static gboolean paste_uri_list(App *app, const gchar *contents,
     GError *error = NULL;
     for (guint i = 0; i < files->len; i++) {
         GFile *source = g_ptr_array_index(files, i);
-        gboolean success = move
-                               ? gfm_move_to_directory(source,
-                                                       destination_directory,
-                                                       &error)
-                               : gfm_copy_to_directory(source,
-                                                       destination_directory,
-                                                       &error);
+        gboolean success;
+        if (move) {
+            success = gfm_move_to_directory(source, destination_directory,
+                                             &error);
+        } else {
+            queue_copy(app, source, destination_directory);
+            success = TRUE;
+        }
         if (!success) {
             break;
         }
@@ -504,11 +1234,36 @@ static void open_selected(App *app) {
     g_object_unref(file);
 }
 
+static void copy_selected_path(App *app) {
+    GFile *file = selected_file(app);
+    if (file == NULL) {
+        return;
+    }
+    gchar *path = gfm_get_path_or_uri(file);
+    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clipboard, path, -1);
+    gtk_clipboard_store(clipboard);
+    g_free(path);
+    g_object_unref(file);
+}
+
 static void on_file_context_action(GtkMenuItem *item, gpointer data) {
     App *app = data;
     const gchar *action = g_object_get_data(G_OBJECT(item), "action");
     if (g_str_equal(action, "open")) {
         open_selected(app);
+    } else if (g_str_equal(action, "properties")) {
+        GFile *file = selected_file(app);
+        if (file != NULL) {
+            show_properties(app, file);
+            g_object_unref(file);
+        }
+    } else if (g_str_equal(action, "new-file")) {
+        create_item(app, FALSE);
+    } else if (g_str_equal(action, "new-folder")) {
+        create_item(app, TRUE);
+    } else if (g_str_equal(action, "copy-path")) {
+        copy_selected_path(app);
     } else if (g_str_equal(action, "copy-clipboard")) {
         set_file_clipboard(app, FALSE);
     } else if (g_str_equal(action, "cut")) {
@@ -539,9 +1294,19 @@ static gboolean on_file_button_press(GtkWidget *widget, GdkEventButton *event,
     }
     App *app = data;
     GtkTreePath *path = NULL;
-    if (gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget), (gint)event->x,
-                                      (gint)event->y, &path, NULL, NULL,
-                                      NULL)) {
+    if (widget == app->icon_view) {
+        path = gtk_icon_view_get_path_at_pos(GTK_ICON_VIEW(widget),
+                                             (gint)event->x, (gint)event->y);
+        if (path != NULL) {
+            gtk_icon_view_unselect_all(GTK_ICON_VIEW(widget));
+            gtk_icon_view_select_path(GTK_ICON_VIEW(widget), path);
+            gtk_tree_path_free(path);
+        } else {
+            gtk_icon_view_unselect_all(GTK_ICON_VIEW(widget));
+        }
+    } else if (gtk_tree_view_get_path_at_pos(
+                   GTK_TREE_VIEW(widget), (gint)event->x, (gint)event->y,
+                   &path, NULL, NULL, NULL)) {
         GtkTreeSelection *selection = gtk_tree_view_get_selection(
             GTK_TREE_VIEW(widget));
         gtk_tree_selection_select_path(selection, path);
@@ -556,8 +1321,13 @@ static gboolean on_file_button_press(GtkWidget *widget, GdkEventButton *event,
     g_clear_object(&selected);
     if (has_selection) {
         append_context_item(menu, "Open", "open", app);
+        append_context_item(menu, "Copy Path", "copy-path", app);
         append_context_item(menu, "Copy", "copy-clipboard", app);
         append_context_item(menu, "Cut", "cut", app);
+        append_context_item(menu, "Properties", "properties", app);
+    } else {
+        append_context_item(menu, "New Folder…", "new-folder", app);
+        append_context_item(menu, "New File…", "new-file", app);
     }
     append_context_item(menu, "Paste", "paste", app);
     if (has_selection) {
@@ -585,7 +1355,7 @@ static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event,
     gboolean shift = (modifiers & GDK_SHIFT_MASK) != 0;
     gboolean alt = (modifiers & GDK_MOD1_MASK) != 0;
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(app->window));
-    gboolean list_focused = focus == app->view;
+    gboolean list_focused = focus == app->view || focus == app->icon_view;
 
     if (control && event->keyval == GDK_KEY_l) {
         gtk_widget_grab_focus(app->address);
@@ -595,6 +1365,18 @@ static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event,
     if (control && event->keyval == GDK_KEY_h) {
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hidden_button),
                                      !app->show_hidden);
+        return TRUE;
+    }
+    if (control && (event->keyval == GDK_KEY_1 ||
+                    event->keyval == GDK_KEY_2)) {
+        app->icon_mode = event->keyval == GDK_KEY_2;
+        gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack),
+                                         app->icon_mode ? "icons" : "list");
+        save_config(app);
+        return TRUE;
+    }
+    if (control && event->keyval == GDK_KEY_n) {
+        create_item(app, shift);
         return TRUE;
     }
     if (alt && event->keyval == GDK_KEY_Left) {
@@ -689,6 +1471,60 @@ static void on_hidden_toggled(GtkToggleButton *button, gpointer data) {
     refresh_listing(app);
 }
 
+static void bookmark_current_location(App *app) {
+    add_unique_file(app->bookmarks, app->location, 50);
+    save_config(app);
+    refresh_sidebar(app);
+}
+
+static void forget_current_bookmark(App *app) {
+    for (guint i = 0; i < app->bookmarks->len; i++) {
+        if (g_file_equal(g_ptr_array_index(app->bookmarks, i),
+                         app->location)) {
+            g_ptr_array_remove_index(app->bookmarks, i);
+            save_config(app);
+            refresh_sidebar(app);
+            return;
+        }
+    }
+}
+
+static void on_bookmark_clicked(GtkButton *button, gpointer data) {
+    App *app = data;
+    if (g_str_equal(g_object_get_data(G_OBJECT(button), "bookmark-action"),
+                    "remove")) {
+        forget_current_bookmark(app);
+    } else {
+        bookmark_current_location(app);
+    }
+}
+
+static void on_new_folder_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    create_item(data, TRUE);
+}
+
+static void on_new_file_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    create_item(data, FALSE);
+}
+
+static void on_list_view_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+    app->icon_mode = FALSE;
+    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack), "list");
+    save_config(app);
+}
+
+static void on_icon_view_clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    App *app = data;
+    app->icon_mode = TRUE;
+    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack), "icons");
+    save_config(app);
+}
+
 static GtkWidget *add_button(GtkWidget *box, const gchar *label,
                              const gchar *operation, App *app) {
     GtkWidget *button = gtk_button_new_with_label(label);
@@ -708,6 +1544,21 @@ static void add_text_column(GtkTreeView *view, const gchar *title,
         title, renderer, "text", model_column, NULL);
     gtk_tree_view_column_set_resizable(column, TRUE);
     gtk_tree_view_column_set_expand(column, expand);
+    gtk_tree_view_append_column(view, column);
+}
+
+static void add_name_column(GtkTreeView *view) {
+    GtkCellRenderer *preview = gtk_cell_renderer_pixbuf_new();
+    GtkCellRenderer *text = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn *column = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_title(column, "Name");
+    gtk_tree_view_column_pack_start(column, preview, FALSE);
+    gtk_tree_view_column_add_attribute(column, preview, "pixbuf",
+                                       COL_PREVIEW);
+    gtk_tree_view_column_pack_start(column, text, TRUE);
+    gtk_tree_view_column_add_attribute(column, text, "text", COL_NAME);
+    gtk_tree_view_column_set_resizable(column, TRUE);
+    gtk_tree_view_column_set_expand(column, TRUE);
     gtk_tree_view_append_column(view, column);
 }
 
@@ -733,6 +1584,27 @@ static void sidebar_add_root(App *app, const gchar *name, GFile *file,
     g_clear_object(&volume_mount);
 }
 
+static void sidebar_add_shortcut_group(App *app, const gchar *name,
+                                       GPtrArray *files) {
+    GtkTreeIter group;
+    gtk_tree_store_append(app->sidebar_store, &group, NULL);
+    gtk_tree_store_set(app->sidebar_store, &group, SIDE_NAME, name,
+                       SIDE_LOADED, TRUE, -1);
+    for (guint i = 0; files != NULL && i < files->len; i++) {
+        GFile *file = g_ptr_array_index(files, i);
+        gchar *basename = g_file_get_basename(file);
+        if (basename == NULL || basename[0] == '\0') {
+            g_free(basename);
+            basename = gfm_get_path_or_uri(file);
+        }
+        GtkTreeIter shortcut;
+        gtk_tree_store_append(app->sidebar_store, &shortcut, &group);
+        gtk_tree_store_set(app->sidebar_store, &shortcut, SIDE_NAME, basename,
+                           SIDE_FILE, file, SIDE_LOADED, TRUE, -1);
+        g_free(basename);
+    }
+}
+
 static void refresh_sidebar(App *app) {
     if (app->sidebar_store == NULL) {
         return;
@@ -744,6 +1616,9 @@ static void refresh_sidebar(App *app) {
     sidebar_add_root(app, "File System", root, NULL, NULL);
     g_object_unref(home);
     g_object_unref(root);
+    sidebar_add_shortcut_group(app, "Bookmarks", app->bookmarks);
+    sidebar_add_shortcut_group(app, "Recent Locations",
+                               app->recent_locations);
 
     GList *volumes = g_volume_monitor_get_volumes(app->volume_monitor);
     for (GList *item = volumes; item != NULL; item = item->next) {
@@ -1048,11 +1923,37 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(tools), app->hidden_button, FALSE, FALSE, 0);
     g_signal_connect(app->hidden_button, "toggled",
                      G_CALLBACK(on_hidden_toggled), app);
+    GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(outer), actions, FALSE, FALSE, 0);
+    GtkWidget *new_folder = add_button(actions, "New Folder…", NULL, app);
+    GtkWidget *new_file = add_button(actions, "New File…", NULL, app);
+    g_signal_connect(new_folder, "clicked",
+                     G_CALLBACK(on_new_folder_clicked), app);
+    g_signal_connect(new_file, "clicked",
+                     G_CALLBACK(on_new_file_clicked), app);
+    GtkWidget *list_button = add_button(actions, "List", NULL, app);
+    GtkWidget *icons_button = add_button(actions, "Icons", NULL, app);
+    g_signal_connect(list_button, "clicked", G_CALLBACK(on_list_view_clicked),
+                     app);
+    g_signal_connect(icons_button, "clicked",
+                     G_CALLBACK(on_icon_view_clicked), app);
+    GtkWidget *bookmark_button = add_button(actions, "Bookmark Location",
+                                            NULL, app);
+    g_object_set_data(G_OBJECT(bookmark_button), "bookmark-action", "add");
+    g_signal_connect(bookmark_button, "clicked",
+                     G_CALLBACK(on_bookmark_clicked), app);
+    GtkWidget *remove_bookmark_button = add_button(
+        actions, "Remove Bookmark", NULL, app);
+    g_object_set_data(G_OBJECT(remove_bookmark_button), "bookmark-action",
+                      "remove");
+    g_signal_connect(remove_bookmark_button, "clicked",
+                     G_CALLBACK(on_bookmark_clicked), app);
 
     app->store = gtk_list_store_new(N_COLUMNS, G_TYPE_STRING, G_TYPE_STRING,
-                                    G_TYPE_STRING, G_TYPE_FILE);
+                                    G_TYPE_STRING, G_TYPE_FILE,
+                                    GDK_TYPE_PIXBUF);
     app->view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app->store));
-    add_text_column(GTK_TREE_VIEW(app->view), "Name", COL_NAME, TRUE);
+    add_name_column(GTK_TREE_VIEW(app->view));
     add_text_column(GTK_TREE_VIEW(app->view), "Type", COL_TYPE, FALSE);
     add_text_column(GTK_TREE_VIEW(app->view), "Size", COL_SIZE, FALSE);
     gtk_tree_view_set_headers_clickable(GTK_TREE_VIEW(app->view), TRUE);
@@ -1089,12 +1990,34 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(outer), paned, TRUE, TRUE, 0);
     gtk_paned_pack1(GTK_PANED(paned), sidebar_scroll, FALSE, FALSE);
 
+    app->icon_view = gtk_icon_view_new_with_model(GTK_TREE_MODEL(app->store));
+    gtk_widget_set_name(app->icon_view, "file-icon-view");
+    gtk_icon_view_set_text_column(GTK_ICON_VIEW(app->icon_view), COL_NAME);
+    gtk_icon_view_set_pixbuf_column(GTK_ICON_VIEW(app->icon_view), COL_PREVIEW);
+    gtk_icon_view_set_item_width(GTK_ICON_VIEW(app->icon_view), 100);
+    gtk_icon_view_set_activate_on_single_click(GTK_ICON_VIEW(app->icon_view),
+                                               FALSE);
+    g_signal_connect(app->icon_view, "item-activated",
+                     G_CALLBACK(on_icon_item_activated), app);
+    app->view_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(app->view_stack),
+                                  GTK_STACK_TRANSITION_TYPE_CROSSFADE);
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), app->view);
-    gtk_paned_pack2(GTK_PANED(paned), scroll, TRUE, FALSE);
+    GtkWidget *icon_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(icon_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(icon_scroll), app->icon_view);
+    gtk_stack_add_named(GTK_STACK(app->view_stack), scroll, "list");
+    gtk_stack_add_named(GTK_STACK(app->view_stack), icon_scroll, "icons");
+    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack),
+                                     app->icon_mode ? "icons" : "list");
+    gtk_paned_pack2(GTK_PANED(paned), app->view_stack, TRUE, FALSE);
     g_signal_connect(app->view, "button-press-event",
+                     G_CALLBACK(on_file_button_press), app);
+    g_signal_connect(app->icon_view, "button-press-event",
                      G_CALLBACK(on_file_button_press), app);
     g_signal_connect(app->window, "key-press-event",
                      G_CALLBACK(on_window_key_press), app);
@@ -1135,6 +2058,22 @@ static void app_activate(GtkApplication *application, gpointer user_data) {
 }
 
 static void app_free(App *app) {
+    g_mutex_lock(&app->copy_mutex);
+    app->shutting_down = TRUE;
+    if (app->copy_cancellable != NULL) {
+        g_cancellable_cancel(app->copy_cancellable);
+    }
+    g_cond_broadcast(&app->copy_condition);
+    g_mutex_unlock(&app->copy_mutex);
+    if (app->copy_thread != NULL) {
+        g_thread_join(app->copy_thread);
+    }
+    if (app->copy_timer != 0) {
+        g_source_remove(app->copy_timer);
+    }
+    if (app->copy_queue != NULL) {
+        g_queue_free_full(app->copy_queue, copy_job_free);
+    }
     if (app->volume_monitor != NULL) {
         if (app->volume_added_handler != 0) {
             g_signal_handler_disconnect(app->volume_monitor,
@@ -1160,8 +2099,19 @@ static void app_free(App *app) {
     if (app->history != NULL) {
         g_ptr_array_unref(app->history);
     }
+    if (app->bookmarks != NULL) {
+        g_ptr_array_unref(app->bookmarks);
+    }
+    if (app->recent_locations != NULL) {
+        g_ptr_array_unref(app->recent_locations);
+    }
     g_free(app->config_path);
     g_free(app->start_location);
+    g_free(app->copy_current_path);
+    g_free(app->copy_error);
+    g_clear_object(&app->copy_cancellable);
+    g_cond_clear(&app->copy_condition);
+    g_mutex_clear(&app->copy_mutex);
 }
 
 static void app_open(GApplication *application, GFile **files, gint count,
@@ -1194,7 +2144,13 @@ static void app_open(GApplication *application, GFile **files, gint count,
 
 int main(int argc, char **argv) {
     App app = {0};
+    g_mutex_init(&app.copy_mutex);
+    g_cond_init(&app.copy_condition);
+    app.copy_queue = g_queue_new();
+    app.copy_cancellable = g_cancellable_new();
     app.history = g_ptr_array_new_with_free_func(g_object_unref);
+    app.bookmarks = g_ptr_array_new_with_free_func(g_object_unref);
+    app.recent_locations = g_ptr_array_new_with_free_func(g_object_unref);
     gchar *config_dir = g_build_filename(g_get_user_config_dir(),
                                          "GnuChanFileManager", NULL);
     app.config_path = g_build_filename(config_dir, "config.conf", NULL);
@@ -1204,8 +2160,13 @@ int main(int argc, char **argv) {
                                   G_KEY_FILE_NONE, NULL)) {
         app.show_hidden = g_key_file_get_boolean(key_file, "General",
                                                  "show_hidden", NULL);
+        app.icon_mode = g_key_file_get_boolean(key_file, "General",
+                                               "icon_mode", NULL);
         app.start_location = g_key_file_get_string(
             key_file, "General", "start_location", NULL);
+        load_file_list(key_file, "bookmarks", app.bookmarks, 50);
+        load_file_list(key_file, "recent_locations",
+                       app.recent_locations, 10);
     }
     g_key_file_unref(key_file);
     if (app.start_location == NULL) {
@@ -1217,6 +2178,7 @@ int main(int argc, char **argv) {
         app_free(&app);
         return 0;
     }
+    app.copy_thread = g_thread_new("gfm-copy-queue", copy_worker, &app);
     GtkApplication *application = gtk_application_new(
         APP_ID, G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(application, "activate", G_CALLBACK(app_activate), &app);

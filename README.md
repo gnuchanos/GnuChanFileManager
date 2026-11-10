@@ -1,19 +1,33 @@
 # GnuChan File Manager
 
-GnuChan File Manager is a small Nemo-like GTK 3 desktop file manager for
-Linux. It provides directory browsing, sortable name/type/size columns,
+GnuChan File Manager is a GTK 3 desktop file manager for Linux. It provides
+directory browsing in list or icon view, sortable name/type/size columns,
 default-application launching, back/forward/up and address navigation,
-case-insensitive filtering, a persistent hidden-files toggle, and confirmed
-copy, move, rename, Trash, and permanent-delete actions. A left sidebar provides
-a lazy-loaded directory tree and desktop-reported mounted or removable
-volumes, with mount, unmount, and eject actions where the device supports them.
-File actions are grouped in a right-click menu.
+case-insensitive filtering, a persistent hidden-files toggle, and create,
+rename, copy, move, Trash, and permanent-delete actions. A left sidebar
+provides a lazy-loaded directory tree, saved bookmarks, recent locations, and
+desktop-reported mounted or removable volumes, with mount, unmount, and eject
+actions where the device supports them.
+
+The right-click menu includes item properties and path copying. Properties
+show the location, type, size, modification time, and (where supported)
+editable Unix read/write/execute bits. New files are created empty; new
+folders are created in the current directory. Image previews use GdkPixbuf;
+video frame previews use `ffmpeg` when available and are cached in the XDG
+thumbnail cache. Copies are queued sequentially with progress and pause/resume
+controls.
+
+This feature set does not include tabs, archive creation/extraction, or an
+integrated terminal action. Unix permission editing depends on the backing
+filesystem; filesystems that do not preserve chmod changes report that
+limitation instead of claiming success.
 
 ## Requirements
 
 - GTK 3 development files
 - GLib/GIO development files
 - `pkg-config`, a C11 compiler, and GNU Make
+- Optional at runtime: `ffmpeg` for generating video frame previews
 
 On Debian/Ubuntu, install the build prerequisites with:
 
@@ -31,8 +45,10 @@ make test
 ```
 
 The focused file-operations tests create and clean `.test-work` within the
-project directory. They cover safe child names, clipboard URI-list parsing,
-copy/move/rename/delete, and refusing to copy a directory into itself.
+project directory. They cover safe child names, clipboard URI-list parsing, path extraction,
+creating files and folders, permission updates where supported, copy progress
+and cancellation, copy/move/rename/delete, and refusing to copy a directory
+into itself.
 
 ## Install
 
@@ -65,6 +81,8 @@ and the current user's device permissions.
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected files |
+| `Ctrl+N` / `Ctrl+Shift+N` | Create an empty file / new folder |
+| `Ctrl+1` / `Ctrl+2` | List / icon view |
 | `F2` | Rename selected item |
 | `Delete` / `Shift+Delete` | Move to Trash / permanently delete |
 | `Ctrl+H` | Toggle hidden files |
