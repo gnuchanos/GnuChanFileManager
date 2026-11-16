@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=GnuChanFileManager
+Name=GnuChan File Manager
 GenericName=File Manager
 Comment=Browse and manage files
 Exec=GnuChanFileManager %U

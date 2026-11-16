@@ -67,27 +67,41 @@ The app reads and writes
 `$XDG_CONFIG_HOME/GnuChanFileManager/config.conf` (normally
 `~/.config/GnuChanFileManager/config.conf`). Configuration uses plain
 `[Section]` and `key=value` syntax and is never executed as code. The bundled
-`config.conf` is an install-time template. Only single safe child names are
-accepted by rename and recursive file operations; file paths are represented
-as `GFile` objects. Opening files uses GIO's default-application API rather
-than a shell. Existing destination files are not overwritten. Trash and
-permanent deletion require confirmation. Copy and cut/paste exchange standard
-file URI clipboard data; transfers use GIO and do not invoke a shell. Mounting,
-unmounting, and ejecting depend on the desktop's GIO volume-monitor backend
-and the current user's device permissions.
+`src/config/config.conf` is the install-time template. Only single safe child
+names are accepted by rename and recursive file operations; file paths are
+represented as `GFile` objects. Opening files uses GIO's default-application
+API rather than a shell. Existing destination files are not overwritten. Trash
+and permanent deletion require confirmation. Copy and cut/paste exchange
+standard file URI clipboard data; transfers use GIO and do not invoke a shell.
+Mounting, unmounting, and ejecting depend on the desktop's GIO volume-monitor
+backend and the current user's device permissions.
 
 ## Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected files |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected file(s) |
+| `Ctrl+A` | Select all items |
+| `Ctrl+1` / `Ctrl+2` | List view / icon view (thumbnails) |
 | `Ctrl+N` / `Ctrl+Shift+N` | Create an empty file / new folder |
-| `Ctrl+1` / `Ctrl+2` | List / icon view |
 | `F2` | Rename selected item |
-| `Delete` / `Shift+Delete` | Move to Trash / permanently delete |
+| `F5` | Refresh current directory |
+| `Delete` / `Shift+Delete` | Move to Trash / permanently delete selected item(s) |
 | `Ctrl+H` | Toggle hidden files |
 | `Ctrl+L` | Focus the location field |
-| `Alt+Left` / `Alt+Right` / `Alt+Up` | Back / forward / parent directory |
+| `Enter` | Open selected item |
+| `Backspace` / `Alt+Up` | Parent directory |
+| `Alt+Left` / `Alt+Right` | Back / forward in history |
+| `Up` / `Down` / `Home` / `End` / `PgUp` / `PgDn` | Navigate list |
+| `Esc` | Clear selection / close dialogs |
+
+## Mouse shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl + Left Click` | Toggle multi-selection on items |
+| `Ctrl + Mouse Wheel` | Zoom in / out (font and row size) |
+| `Double Click` | Open file or folder |
 
 ## Version
 

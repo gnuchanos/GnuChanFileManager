@@ -1,0 +1,16 @@
+font=21
+theme=0
+syntax_highlight=1
+vhs=0
+crt=0
+screen_shake=0
+typewriter=0
+particles=0
+blink_cursor=1
+text_bloom=0
+bloom_strength=50
+shake_strength=30
+particle_strength=40
+vhs_strength=30
+crt_strength=30
+sound=0

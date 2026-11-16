@@ -1,2190 +1,4470 @@
+/*
+ * GnuChanFileManager — pure X11/Xft file manager.
+ *
+ * UI: Xlib + Xft (same stack as GnuChanWM, GnuChanDM, GnuChanDock).
+ * File ops: GIO via gfm_file_ops.c (gio-2.0, no GTK dependency).
+ * Volume monitor: GIO GVolumeMonitor.
+ * Config: plain key=value file.
+ * Clipboard: X11 selection protocol, x-special/gnome-copied-files +
+ *            text/uri-list (compatible with Nemo, Thunar, etc.).
+ *
+ * License: GPL3
+ */
 #include "gfm_file_ops.h"
 
-#include <gtk/gtk.h>
-#include <glib/gstdio.h>
-#include <sys/stat.h>
+#include <X11/Xlib.h>
+#include <X11/Xft/Xft.h>
+#include <X11/keysym.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/cursorfont.h>
+#include <gio/gio.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#include <pwd.h>
 
-#define APP_ID "org.gnuchan.GnuChanFileManager"
+/* ── dimensions ────────────────────────────────────────────────────── */
+#define WIN_W        900
+#define WIN_H        600
+#define BAR_H         30   /* address + search bar height */
+#define TOOL_H        28   /* action buttons bar height   */
+#define STATUS_H      20   /* bottom status bar height    */
+#define SIDE_W       190   /* sidebar width               */
+#define ROW_H_DEFAULT 22   /* default file row height     */
+#define FONT_PX_DEFAULT 13
+#define FONT_PX_MIN   9
+#define FONT_PX_MAX   28
+#define SCROLL_W      12   /* scrollbar width             */
+#define PAD            6
+#define BTN_H         22
+#define BTN_PAD        8
 
-enum { COL_NAME, COL_TYPE, COL_SIZE, COL_FILE, COL_PREVIEW, N_COLUMNS };
-enum {
-    SIDE_NAME,
-    SIDE_FILE,
-    SIDE_VOLUME,
-    SIDE_MOUNT,
-    SIDE_LOADED,
-    N_SIDE_COLUMNS
-};
+/* ── colours ────────────────────────────────────────────────────────── */
+#define C_BG          "#1a0b2e"
+#define C_PANEL       "#32143f"
+#define C_EDGE        "#7b2cbf"
+#define C_FIELD       "#241033"
+#define C_FIELD_ON    "#3d1a55"
+#define C_TEXT        "#e0c3fc"
+#define C_MUTED       "#9d7bba"
+#define C_ACCENT      "#c77dff"
+#define C_SEL         "#5a2a8f"
+#define C_BTN         "#32143f"
+#define C_BTN_HOT     "#4a1f60"
+
+/* ── limits ─────────────────────────────────────────────────────────── */
+#define MAX_ENTRIES   4096
+#define MAX_SIDE       256
+#define MAX_HISTORY     64
+#define MAX_BOOKMARKS   50
+#define MAX_RECENT      10
+#define MAX_COPY_Q     256
+#define TEXT_SIZE      512
+#define NAME_SIZE      256
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Data structures
+ * ═════════════════════════════════════════════════════════════════════*/
+
+typedef enum { FT_DIR, FT_REG, FT_LINK, FT_OTHER } FileType;
+
+typedef enum { SORT_NAME, SORT_TYPE, SORT_SIZE, SORT_DATE } SortMode;
 
 typedef struct {
-    GFile *file;
-    gboolean move;
-} ClipboardFile;
+    char name[NAME_SIZE];
+    char size[32];        /* formatted */
+    char type_str[16];    /* "Folder" / "File" / "Link" / "Other" */
+    char content_type[96]; /* MIME/content type if known */
+    FileType ftype;
+    GFile *file;          /* owned reference */
+    gint64   size_bytes;
+    guint64  mtime;
+    int selected;         /* multi-select flag */
+    XImage *thumb;        /* scaled thumbnail for icon view (optional) */
+    int thumb_w, thumb_h;
+    int thumb_req_size;   /* size thumbnail was generated for */
+    GdkPixbuf *thumb_pixbuf; /* decoded source for fast rescaling */
+    int thumb_failed;     /* tried and no thumbnail available */
+} Entry;
+
+static int g_thumb_load_budget = 0;
+
+typedef enum { ST_PLACES_GROUP, ST_HOME, ST_ROOT, ST_BM_GROUP, ST_RECENT_GROUP,
+               ST_DEV_GROUP, ST_BM, ST_RECENT, ST_VOL } SideKind;
+
+typedef struct {
+    char  name[NAME_SIZE];
+    SideKind kind;
+    GFile    *file;    /* NULL for group headers and unmounted volumes */
+    GVolume  *volume;  /* non-NULL for volumes                        */
+    GMount   *mount;   /* non-NULL for mounts                         */
+    int       indent;  /* 0 = root, 1 = child                         */
+    int       expandable;
+    int       expanded;
+} SideEntry;
 
 typedef struct {
     GFile *source;
     GFile *destination_directory;
+    int    is_move;
 } CopyJob;
 
 typedef struct {
-    GtkListStore *store;
-    GtkTreeRowReference *row;
-    GFile *file;
-    gchar *cache_path;
-} VideoThumbnailRequest;
+    Display  *dpy;
+    int       scr;
+    Window    win;
+    Pixmap    backbuf;
+    Atom      wm_delete;
+    GC        gc;
 
-typedef struct {
-    GtkApplication *application;
-    GtkWidget *window;
-    GtkWidget *address;
-    GtkWidget *search;
-    GtkWidget *back_button;
-    GtkWidget *forward_button;
-    GtkWidget *up_button;
-    GtkWidget *hidden_button;
-    GtkWidget *view;
-    GtkWidget *icon_view;
-    GtkWidget *view_stack;
-    GtkListStore *store;
-    GtkWidget *sidebar;
-    GtkTreeStore *sidebar_store;
+    /* fonts / colours */
+    XftFont  *font;
+    XftFont  *font_bold;
+    XftDraw  *draw;
+
+    XftColor  bg, panel, edge, field, field_on, text, muted, accent, sel,
+              btn, btn_hot;
+
+    int win_w, win_h;    /* current window size */
+
+    /* ── file listing ── */
+    Entry     entries[MAX_ENTRIES];
+    int       entry_count;
+    int       list_scroll;   /* first visible row  */
+    int       list_sel;      /* focused/cursor row (-1) */
+    int       show_hidden;
+    int       icon_mode;     /* 0=list 1=icon (icon not impl yet, placeholder) */
+
+    /* zoom / layout */
+    int       font_px;
+    int       row_h;
+    int       icon_zoom;  /* affects file-area icon/thumbnail size */
+
+    /* sorting */
+    SortMode  sort_mode;
+    int       sort_desc;
+
+    /* selection */
+    int       sel_anchor;
+
+    /* rubber-band selection */
+    int       band_active;
+    int       band_x0, band_y0;
+    int       band_x1, band_y1;
+    int       band_additive;
+    int       band_press; /* potential start */
+
+    /* realtime directory monitoring */
+    GFileMonitor *dir_monitor;
+    gulong    dir_monitor_id;
+    guint     refresh_idle_id;
+
+    char      search[TEXT_SIZE];
+    int       search_len;
+    int       search_focused;
+
+    char      address[TEXT_SIZE];
+    int       address_len;
+    int       address_cursor; /* caret position */
+    int       address_focused;
+
+    /* current location */
+    GFile    *location;
+
+    /* history */
+    GFile    *history[MAX_HISTORY];
+    int       history_count;
+    int       history_index;
+
+    /* bookmarks / recent */
+    GFile    *bookmarks[MAX_BOOKMARKS];
+    int       bookmark_count;
+    GFile    *recent[MAX_RECENT];
+    int       recent_count;
+
+    /* ── sidebar ── */
+    SideEntry side[MAX_SIDE];
+    int       side_count;
+    int       side_scroll;
+    int       side_sel;
+    int       places_expanded;
+    int       bm_expanded;
+    int       recent_expanded;
+    int       dev_expanded;
+
+    /* ── volume monitor ── */
     GVolumeMonitor *volume_monitor;
-    GFile *location;
-    GPtrArray *history;
-    GPtrArray *bookmarks;
-    GPtrArray *recent_locations;
-    guint history_index;
-    gboolean show_hidden;
-    gboolean icon_mode;
-    gchar *config_path;
-    gchar *start_location;
-    GQueue *copy_queue;
-    GThread *copy_thread;
-    GCancellable *copy_cancellable;
-    GMutex copy_mutex;
-    GCond copy_condition;
-    GtkWidget *copy_window;
-    GtkWidget *copy_label;
-    GtkWidget *copy_progress;
-    GtkWidget *copy_pause_button;
-    gchar *copy_current_path;
-    gchar *copy_error;
-    gdouble copy_fraction;
-    guint copy_timer;
-    gboolean copy_running;
-    gboolean copy_paused;
-    gboolean shutting_down;
-    gulong volume_added_handler;
-    gulong volume_removed_handler;
-    gulong mount_added_handler;
-    gulong mount_removed_handler;
+    gulong    vol_add_id, vol_rem_id, mnt_add_id, mnt_rem_id;
+
+    /* ── clipboard ── */
+    Atom      atom_clipboard;
+    Atom      atom_targets;
+    Atom      atom_gnome_files;  /* x-special/gnome-copied-files */
+    Atom      atom_uri_list;     /* text/uri-list                */
+    Atom      atom_utf8;
+    char     *clipboard_data;    /* owned; NULL when we don't own selection */
+    int       clipboard_is_cut;
+
+    /* ── XDND (external drag source) ── */
+    Atom      xdnd_aware, xdnd_enter, xdnd_position, xdnd_status, xdnd_leave,
+              xdnd_drop, xdnd_finished, xdnd_selection, xdnd_action_copy,
+              xdnd_action_move, xdnd_type_list;
+    Window    xdnd_target;
+    int       xdnd_version;
+    char     *xdnd_data; /* owned uri-list payload */
+
+    /* ── copy queue ── */
+    CopyJob   copy_queue[MAX_COPY_Q];
+    int       copy_q_head, copy_q_tail, copy_q_len;
+    pthread_mutex_t copy_mutex;
+    pthread_cond_t  copy_cond;
+    pthread_t copy_thread;
+    int       copy_running;
+    double    copy_fraction;
+    char      copy_current[TEXT_SIZE];
+    char      copy_error[TEXT_SIZE];
+    int       shutting_down;
+
+    /* ── config ── */
+    char config_path[PATH_MAX];
+
+    /* ── context menu ── */
+    int       menu_open;
+    int       menu_x, menu_y;
+    int       menu_on_file;   /* 1=right-click on entry, 0=background */
+    int       menu_sel;       /* -1=none, 0..N=hovered item */
+
+    /* ── input dialog ── */
+    int       dialog_open;
+    char      dialog_title[TEXT_SIZE];
+    char      dialog_prompt[TEXT_SIZE];
+    char      dialog_value[TEXT_SIZE];
+    int       dialog_len;
+    void    (*dialog_ok)(void *app);  /* callback when user confirms */
+
+    /* ── directory picker (for copy/move) ── */
+    int       picker_open;
+    int       picker_move;
+    GFile    *picker_dir;
+    char      picker_names[256][NAME_SIZE];
+    GFile    *picker_files[256];
+    int       picker_count;
+    int       picker_sel;
+    int       picker_scroll;
+
+    /* ── properties dialog ── */
+    int       props_open;
+    char      props_path[TEXT_SIZE];
+    char      props_type[32];
+    char      props_size[64];
+    char      props_mtime[64];
+    guint32   props_mode;
+    int       props_has_mode;
+    GFile    *props_file;    /* NULL if not set */
+
+    /* ── error dialog ── */
+    int       err_open;
+    char      err_text[TEXT_SIZE];
+    char      err_detail[TEXT_SIZE];
+
+    /* resize splitter */
+    int       side_w;        /* current sidebar width (draggable) */
+    int       split_drag;
+    int       split_drag_x0;
+    int       split_side_w0;
+
+    /* drag and drop (internal + XDND source) */
+    int       dnd_press;
+    int       dnd_dragging;
+    int       dnd_start_x;
+    int       dnd_start_y;
+    int       dnd_cur_x;
+    int       dnd_cur_y;
+    int       dnd_index;      /* pressed item index */
+    int       dnd_target_side; /* sidebar drop target index, -1 none */
+    int       dnd_target_item; /* main view folder drop target index, -1 none */
+    int       dnd_external;    /* dragging to external XDND target */
+
+    /* caret blink for text inputs */
+    int       caret_on;
+    long      caret_tick;
+
+    /* XDND throttle */
+    int       xdnd_last_x;
+    int       xdnd_last_y;
+
+    /* layout cache */
+    int       layout_w;
+    int       layout_h;
+    int       layout_side_w;
+
+    /* UI button icons */
+    XImage   *ui_icons[16];
+    int       ui_icon_w[16];
+    int       ui_icon_h[16];
+
+    /* cursor */
+    Cursor    drag_cursor;
+
+    /* external drag icon */
+    Window    drag_icon;
+    XftDraw  *drag_icon_draw;
+    int       drag_icon_w, drag_icon_h;
+
+    /* inline rename */
+    int       rename_active;
+    int       rename_index;
+    char      rename_text[NAME_SIZE];
+    int       rename_len;
+    int       rename_cursor;
+
+    /* status bar */
+    char      free_space[128];
+
+    int       running;
 } App;
 
-static void on_back(GtkButton *button, gpointer data);
-static void on_forward(GtkButton *button, gpointer data);
-static void on_up(GtkButton *button, gpointer data);
-static void on_volume_mounted(GObject *source, GAsyncResult *result,
-                              gpointer data);
-static void queue_copy(App *app, GFile *source, GFile *destination_directory);
-static void refresh_sidebar(App *app);
-static void open_selected(App *app);
+/* ════════════════════════════════════════════════════════════════════
+ * Forward declarations
+ * ══════════════════════════════════════════════════════════════════*/
+static void draw_app(App *a);
+static void refresh_listing(App *a);
+static void refresh_sidebar(App *a);
+static void go_to(App *a, GFile *file, int add_history);
+static void open_entry(App *a, int index);
+static void save_config(App *a);
+static void show_error(App *a, const char *summary, const char *detail);
+static int item_at(App *a, int x, int y);
+static int item_rect(App *a, int i, int *rx, int *ry, int *rw, int *rh);
+static void apply_band_selection(App *a);
+static void show_drag_icon(App *a, int root_x, int root_y);
+static void move_drag_icon(App *a, int root_x, int root_y);
+static void hide_drag_icon(App *a);
+static void start_dialog(App *a, const char *title, const char *prompt,
+                         void (*ok_cb)(void *));
+static void show_props(App *a, int index);
+static int  selected_count(App *a);
+static void clear_selection(App *a);
+static void select_only(App *a, int index);
+static void toggle_selection(App *a, int index);
+static void select_all(App *a);
+static void schedule_refresh(App *a);
+static void update_dir_monitor(App *a);
+static void free_entry_thumb(Entry *e);
+static void clear_entry_thumbs(App *a);
+static void ensure_backbuf(App *a);
+static void recreate_backbuf(App *a);
+static void open_picker(App *a, int is_move);
+static void close_picker(App *a);
+static void picker_refresh(App *a, GFile *dir);
+static void xdnd_send(App *a, Window target, Atom msg, long d1, long d2, long d3, long d4);
+static Window xdnd_find_target(App *a, int root_x, int root_y, int *ver_out);
+static void build_xdnd_data(App *a);
+static void xdnd_update_target(App *a, int root_x, int root_y);
+static char *get_effective_home_path(void);
+static GFile *get_home_file(void);
+static gboolean is_under_home(GFile *file);
 
-static void show_error(App *app, const gchar *summary, GError *error) {
-    GtkWidget *dialog = gtk_message_dialog_new(
-        GTK_WINDOW(app->window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
-        GTK_BUTTONS_CLOSE, "%s", summary);
-    if (error != NULL) {
-        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
-                                                  "%s", error->message);
+/* ════════════════════════════════════════════════════════════════════
+ * Selection / zoom helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static int selected_count(App *a) {
+    int n = 0;
+    for (int i = 0; i < a->entry_count; i++) if (a->entries[i].selected) n++;
+    return n;
+}
+
+static void clear_selection(App *a) {
+    for (int i = 0; i < a->entry_count; i++) a->entries[i].selected = 0;
+}
+
+static void select_only(App *a, int index) {
+    clear_selection(a);
+    a->list_sel = index;
+    a->sel_anchor = index;
+    if (index >= 0 && index < a->entry_count) a->entries[index].selected = 1;
+}
+
+static void toggle_selection(App *a, int index) {
+    if (index < 0 || index >= a->entry_count) return;
+    a->entries[index].selected = !a->entries[index].selected;
+    a->list_sel = index;
+    a->sel_anchor = index;
+    if (selected_count(a) == 0) a->list_sel = -1;
+}
+
+static void select_range(App *a, int from, int to) {
+    if (a->entry_count <= 0) return;
+    if (from < 0) from = 0;
+    if (to < 0) to = 0;
+    if (from >= a->entry_count) from = a->entry_count - 1;
+    if (to >= a->entry_count) to = a->entry_count - 1;
+    int lo = from < to ? from : to;
+    int hi = from < to ? to : from;
+    clear_selection(a);
+    for (int i = lo; i <= hi; i++) a->entries[i].selected = 1;
+    a->list_sel = to;
+}
+
+static void select_all(App *a) {
+    for (int i = 0; i < a->entry_count; i++) a->entries[i].selected = 1;
+    if (a->entry_count > 0 && a->list_sel < 0) a->list_sel = 0;
+}
+
+static void load_fonts(App *a) {
+    if (!a->dpy) return;
+    if (a->draw) { XftDrawDestroy(a->draw); a->draw = NULL; }
+    if (a->font_bold && a->font_bold != a->font)
+        XftFontClose(a->dpy, a->font_bold);
+    if (a->font) XftFontClose(a->dpy, a->font);
+    a->font = NULL; a->font_bold = NULL;
+
+    char fname[64];
+    snprintf(fname, sizeof(fname), "monospace:pixelsize=%d", a->font_px);
+    a->font = XftFontOpenName(a->dpy, a->scr, fname);
+    if (!a->font) a->font = XftFontOpenName(a->dpy, a->scr, "fixed:size=12");
+    snprintf(fname, sizeof(fname), "monospace:pixelsize=%d:bold", a->font_px);
+    a->font_bold = XftFontOpenName(a->dpy, a->scr, fname);
+    if (!a->font_bold) a->font_bold = a->font;
+
+    a->row_h = a->font_px + 9;
+    if (a->row_h < 16) a->row_h = 16;
+
+    recreate_backbuf(a);
+}
+
+static void clear_entry_thumbs(App *a) {
+    for (int i = 0; i < a->entry_count; i++) free_entry_thumb(&a->entries[i]);
+}
+
+static int icon_thumb_size(App *a) {
+    int s = 96 + a->icon_zoom * 16;
+    if (s < 48) s = 48;
+    if (s > 256) s = 256;
+    return s;
+}
+
+static void apply_zoom(App *a, int delta) {
+    /* Zoom changes icon/thumbnail size in the file area (not the whole UI). */
+    a->icon_zoom += delta;
+    if (a->icon_zoom < -3) a->icon_zoom = -3;
+    if (a->icon_zoom > 10) a->icon_zoom = 10;
+    /* thumbnails regenerated lazily at new size to avoid lag */
+    draw_app(a);
+}
+
+static int is_video_content_type(const char *ctype) {
+    return ctype && g_str_has_prefix(ctype, "video/");
+}
+
+static int is_image_content_type(const char *ctype) {
+    return ctype && g_str_has_prefix(ctype, "image/");
+}
+
+static gboolean content_type_is(const char *ctype, const char *want) {
+    return ctype && g_strcmp0(ctype, want) == 0;
+}
+
+static gboolean has_suffix_ci(const char *name, const char *suf) {
+    if (!name || !suf) return FALSE;
+    size_t n = strlen(name), m = strlen(suf);
+    if (m > n) return FALSE;
+    return g_ascii_strcasecmp(name + n - m, suf) == 0;
+}
+
+static gboolean is_pdf_entry(const Entry *e) {
+    return content_type_is(e->content_type, "application/pdf") || has_suffix_ci(e->name, ".pdf");
+}
+
+static gboolean is_svg_entry(const Entry *e) {
+    return content_type_is(e->content_type, "image/svg+xml") ||
+           content_type_is(e->content_type, "image/svg") ||
+           has_suffix_ci(e->name, ".svg") || has_suffix_ci(e->name, ".svgz");
+}
+
+static gboolean is_office_entry(const Entry *e) {
+    const char *ct = e->content_type;
+    if (ct) {
+        if (g_str_has_prefix(ct, "application/vnd.oasis.opendocument.")) return TRUE;
+        if (g_str_has_prefix(ct, "application/vnd.openxmlformats-officedocument.")) return TRUE;
+        if (g_str_has_prefix(ct, "application/vnd.ms-")) return TRUE;
+        if (content_type_is(ct, "application/msword")) return TRUE;
+        if (content_type_is(ct, "application/vnd.ms-excel")) return TRUE;
+        if (content_type_is(ct, "application/vnd.ms-powerpoint")) return TRUE;
+        if (content_type_is(ct, "application/rtf") || content_type_is(ct, "text/rtf")) return TRUE;
     }
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    return has_suffix_ci(e->name, ".odt") || has_suffix_ci(e->name, ".ods") || has_suffix_ci(e->name, ".odp") ||
+           has_suffix_ci(e->name, ".doc") || has_suffix_ci(e->name, ".docx") ||
+           has_suffix_ci(e->name, ".xls") || has_suffix_ci(e->name, ".xlsx") ||
+           has_suffix_ci(e->name, ".ppt") || has_suffix_ci(e->name, ".pptx") ||
+           has_suffix_ci(e->name, ".rtf");
 }
 
-static gchar *format_size(guint64 size, gboolean directory) {
-    if (directory) {
-        return g_strdup("—");
-    }
-    return g_format_size(size);
+static gboolean ensure_xdg_thumb_dir(char *out, size_t outsz) {
+    const char *cache = g_get_user_cache_dir();
+    if (!cache) return FALSE;
+    g_snprintf(out, outsz, "%s/thumbnails/normal", cache);
+    return g_mkdir_with_parents(out, 0700) == 0;
 }
 
-static GFile *file_from_address(const gchar *text, GFile *base) {
-    gchar *scheme = g_uri_parse_scheme(text);
-    GFile *file = NULL;
-    if (scheme != NULL) {
-        file = g_file_new_for_uri(text);
-    } else {
-        gchar *expanded = NULL;
-        if (g_str_equal(text, "~")) {
-            expanded = g_strdup(g_get_home_dir());
-        } else if (g_str_has_prefix(text, "~/")) {
-            expanded = g_build_filename(g_get_home_dir(), text + 2, NULL);
-        } else {
-            expanded = g_strdup(text);
-        }
-        if (g_path_is_absolute(expanded)) {
-            file = g_file_new_for_path(expanded);
-        } else if (base != NULL) {
-            file = g_file_resolve_relative_path(base, expanded);
-        } else {
-            gchar *home_path = g_build_filename(g_get_home_dir(), expanded, NULL);
-            file = g_file_new_for_path(home_path);
-            g_free(home_path);
-        }
-        g_free(expanded);
-    }
-    g_free(scheme);
-    return file;
-}
-
-static gboolean is_hidden_name(const gchar *name) {
-    return name != NULL && name[0] == '.';
-}
-
-static gchar *video_thumbnail_cache_path(GFile *file) {
-    gchar *uri = g_file_get_uri(file);
-    gchar *digest = g_compute_checksum_for_string(G_CHECKSUM_MD5, uri, -1);
-    gchar *filename = g_strdup_printf("%s/thumbnails/normal/%s.png",
-                                      g_get_user_cache_dir(), digest);
-    g_free(digest);
+static gboolean xdg_thumbnail_path_for_file(GFile *file, char *out, size_t outsz) {
+    char dir[PATH_MAX];
+    if (!ensure_xdg_thumb_dir(dir, sizeof(dir))) return FALSE;
+    char *uri = g_file_get_uri(file);
+    if (!uri) return FALSE;
+    char *md5 = g_compute_checksum_for_string(G_CHECKSUM_MD5, uri, -1);
     g_free(uri);
-    return filename;
-}
-
-static GdkPixbuf *scale_preview(GdkPixbuf *source) {
-    gint width = gdk_pixbuf_get_width(source);
-    gint height = gdk_pixbuf_get_height(source);
-    gdouble scale = MIN(32.0 / width, 32.0 / height);
-    gint preview_width = MAX(1, (gint)(width * scale));
-    gint preview_height = MAX(1, (gint)(height * scale));
-    return gdk_pixbuf_scale_simple(source, preview_width, preview_height,
-                                   GDK_INTERP_BILINEAR);
-}
-
-static void video_thumbnail_request_free(gpointer data) {
-    VideoThumbnailRequest *request = data;
-    g_clear_object(&request->store);
-    if (request->row != NULL) {
-        gtk_tree_row_reference_free(request->row);
-    }
-    g_clear_object(&request->file);
-    g_free(request->cache_path);
-    g_free(request);
-}
-
-static void video_thumbnail_worker(GTask *task, gpointer source_object,
-                                   gpointer task_data,
-                                   GCancellable *cancellable) {
-    (void)source_object;
-    VideoThumbnailRequest *request = task_data;
-    gchar *program = g_find_program_in_path("ffmpeg");
-    gchar *path = g_file_get_path(request->file);
-    if (program == NULL || path == NULL) {
-        g_free(program);
-        g_free(path);
-        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                                "No video thumbnailer is available.");
-        return;
-    }
-
-    GFileInfo *info = g_file_query_info(
-        request->file,
-        G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_TIME_MODIFIED,
-        G_FILE_QUERY_INFO_NONE, cancellable, NULL);
-    gchar *modified = g_strdup_printf("%" G_GUINT64_FORMAT,
-                                      info != NULL
-                                          ? g_file_info_get_attribute_uint64(
-                                                info,
-                                                G_FILE_ATTRIBUTE_TIME_MODIFIED)
-                                          : 0);
-    gchar *size = g_strdup_printf(
-        "%" G_GUINT64_FORMAT,
-        info != NULL ? g_file_info_get_size(info) : 0);
-    gchar *arguments[] = {
-        program, "-nostdin", "-v", "error", "-ss", "1", "-i", path,
-        "-frames:v", "1", "-vf",
-        "scale=96:96:force_original_aspect_ratio=decrease", "-f",
-        "image2pipe", "-vcodec", "png", "pipe:1", NULL
-    };
-    GError *error = NULL;
-    GSubprocess *process = g_subprocess_newv(
-        (const gchar *const *)arguments, G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-        &error);
-    GBytes *output = NULL;
-    if (process != NULL &&
-        g_subprocess_communicate(process, NULL, cancellable, &output, NULL,
-                                 &error) &&
-        g_subprocess_get_successful(process)) {
-        gsize output_size = 0;
-        gconstpointer output_data = g_bytes_get_data(output, &output_size);
-        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
-        if (gdk_pixbuf_loader_write(loader, output_data, output_size, &error) &&
-            gdk_pixbuf_loader_close(loader, &error)) {
-            GdkPixbuf *pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
-            if (pixbuf != NULL) {
-                GdkPixbuf *thumbnail = scale_preview(pixbuf);
-                gchar *cache_directory = g_path_get_dirname(
-                    request->cache_path);
-                g_mkdir_with_parents(cache_directory, 0700);
-                gchar *keys[] = {"tEXt::Thumb::URI", "tEXt::Thumb::MTime",
-                                 "tEXt::Thumb::Size", NULL};
-                gchar *values[] = {NULL, modified, size, NULL};
-                values[0] = g_file_get_uri(request->file);
-                gdk_pixbuf_savev(thumbnail, request->cache_path, "png", keys,
-                                 values, NULL);
-                g_free(values[0]);
-                g_free(cache_directory);
-                g_bytes_unref(output);
-                g_object_unref(loader);
-                g_object_unref(process);
-                g_clear_object(&info);
-                g_free(modified);
-                g_free(size);
-                g_free(program);
-                g_free(path);
-                g_task_return_pointer(task, thumbnail, g_object_unref);
-                return;
-            }
-        }
-        g_object_unref(loader);
-    }
-    if (error == NULL) {
-        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            "Could not generate a video thumbnail.");
-    }
-    g_clear_pointer(&output, g_bytes_unref);
-    g_clear_object(&process);
-    g_clear_object(&info);
-    g_free(modified);
-    g_free(size);
-    g_free(program);
-    g_free(path);
-    g_task_return_error(task, error);
-}
-
-static void video_thumbnail_ready(GObject *source_object, GAsyncResult *result,
-                                  gpointer user_data) {
-    (void)source_object;
-    VideoThumbnailRequest *request = user_data;
-    GdkPixbuf *thumbnail = g_task_propagate_pointer(G_TASK(result), NULL);
-    if (thumbnail != NULL) {
-        GtkTreePath *path = gtk_tree_row_reference_get_path(request->row);
-        if (path != NULL) {
-            GtkTreeIter iter;
-            if (gtk_tree_model_get_iter(GTK_TREE_MODEL(request->store), &iter,
-                                        path)) {
-                gtk_list_store_set(request->store, &iter, COL_PREVIEW,
-                                   thumbnail, -1);
-            }
-            gtk_tree_path_free(path);
-        }
-        g_object_unref(thumbnail);
-    }
-}
-
-static void schedule_video_thumbnail(GtkListStore *store, GFile *file,
-                                     GtkTreeIter *iter) {
-    VideoThumbnailRequest *request = g_new0(VideoThumbnailRequest, 1);
-    request->store = g_object_ref(store);
-    request->file = g_object_ref(file);
-    request->cache_path = video_thumbnail_cache_path(file);
-    GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), iter);
-    request->row = gtk_tree_row_reference_new(GTK_TREE_MODEL(store), path);
-    gtk_tree_path_free(path);
-    GTask *task = g_task_new(NULL, NULL, video_thumbnail_ready, request);
-    g_task_set_task_data(task, request, video_thumbnail_request_free);
-    g_task_run_in_thread(task, video_thumbnail_worker);
-    g_object_unref(task);
-}
-
-static GdkPixbuf *load_video_thumbnail(GFile *file, GFileInfo *info,
-                                       gboolean *needs_generation) {
-    gchar *filename = video_thumbnail_cache_path(file);
-    GdkPixbuf *thumbnail = NULL;
-    if (g_file_test(filename, G_FILE_TEST_IS_REGULAR)) {
-        gchar *uri = g_file_get_uri(file);
-        gchar *modified = g_strdup_printf(
-            "%" G_GUINT64_FORMAT,
-            g_file_info_get_attribute_uint64(
-                info, G_FILE_ATTRIBUTE_TIME_MODIFIED));
-        GdkPixbuf *cached = gdk_pixbuf_new_from_file(filename, NULL);
-        const gchar *cached_uri = cached != NULL
-                                      ? gdk_pixbuf_get_option(
-                                            cached, "tEXt::Thumb::URI")
-                                      : NULL;
-        const gchar *cached_modified =
-            cached != NULL
-                ? gdk_pixbuf_get_option(cached, "tEXt::Thumb::MTime")
-                : NULL;
-        if (cached != NULL && g_strcmp0(cached_uri, uri) == 0 &&
-            g_strcmp0(cached_modified, modified) == 0) {
-            thumbnail = scale_preview(cached);
-        }
-        g_clear_object(&cached);
-        g_free(modified);
-        g_free(uri);
-    }
-    if (thumbnail == NULL) {
-        *needs_generation = TRUE;
-        thumbnail = gtk_icon_theme_load_icon(
-            gtk_icon_theme_get_default(), "video-x-generic", 32,
-            GTK_ICON_LOOKUP_USE_BUILTIN, NULL);
-    }
-    g_free(filename);
-    return thumbnail;
-}
-
-static GdkPixbuf *load_file_preview(GFile *file, GFileInfo *info,
-                                    gboolean *needs_video_thumbnail) {
-    *needs_video_thumbnail = FALSE;
-    if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR) {
-        return NULL;
-    }
-    const gchar *content_type = g_file_info_get_content_type(info);
-    if (content_type == NULL) {
-        return NULL;
-    }
-    if (g_str_has_prefix(content_type, "image/")) {
-        gchar *path = g_file_get_path(file);
-        GdkPixbuf *preview = NULL;
-        if (path != NULL) {
-            preview = gdk_pixbuf_new_from_file_at_scale(path, 32, 32, TRUE,
-                                                        NULL);
-        } else {
-            GFileInputStream *stream = g_file_read(file, NULL, NULL);
-            if (stream != NULL) {
-                preview = gdk_pixbuf_new_from_stream_at_scale(
-                    G_INPUT_STREAM(stream), 32, 32, TRUE, NULL, NULL);
-                g_object_unref(stream);
-            }
-        }
-        g_free(path);
-        return preview;
-    }
-    if (g_str_has_prefix(content_type, "video/")) {
-        return load_video_thumbnail(file, info, needs_video_thumbnail);
-    }
-    return NULL;
-}
-
-static void update_navigation(App *app) {
-    gtk_widget_set_sensitive(app->back_button, app->history_index > 0);
-    gtk_widget_set_sensitive(app->forward_button,
-                             app->history_index + 1 < app->history->len);
-    GFile *parent = g_file_get_parent(app->location);
-    gtk_widget_set_sensitive(app->up_button, parent != NULL);
-    g_clear_object(&parent);
-}
-
-static void save_config(App *app) {
-    GKeyFile *key_file = g_key_file_new();
-    g_key_file_set_boolean(key_file, "General", "show_hidden",
-                           app->show_hidden);
-    g_key_file_set_boolean(key_file, "General", "icon_mode",
-                           app->icon_mode);
-    g_key_file_set_string(key_file, "General", "start_location",
-                          app->start_location);
-    GPtrArray *lists[] = {app->bookmarks, app->recent_locations};
-    const gchar *keys[] = {"bookmarks", "recent_locations"};
-    for (guint list_index = 0; list_index < G_N_ELEMENTS(lists);
-         list_index++) {
-        GPtrArray *items = lists[list_index];
-        if (items == NULL || items->len == 0) {
-            continue;
-        }
-        gchar **paths = g_new0(gchar *, items->len);
-        for (guint i = 0; i < items->len; i++) {
-            paths[i] = gfm_get_path_or_uri(g_ptr_array_index(items, i));
-        }
-        g_key_file_set_string_list(key_file, "General", keys[list_index],
-                                   (const gchar *const *)paths, items->len);
-        g_strfreev(paths);
-    }
-    gchar *data = g_key_file_to_data(key_file, NULL, NULL);
-    gchar *directory = g_path_get_dirname(app->config_path);
-    g_mkdir_with_parents(directory, 0700);
-    GError *error = NULL;
-    if (!g_file_set_contents(app->config_path, data, -1, &error)) {
-        g_warning("Could not save configuration: %s", error->message);
-        g_clear_error(&error);
-    }
-    g_free(directory);
-    g_free(data);
-    g_key_file_unref(key_file);
-}
-
-static void add_unique_file(GPtrArray *files, GFile *file, guint maximum) {
-    for (guint i = 0; i < files->len; i++) {
-        if (g_file_equal(g_ptr_array_index(files, i), file)) {
-            g_ptr_array_remove_index(files, i);
-            break;
-        }
-    }
-    g_ptr_array_insert(files, 0, g_object_ref(file));
-    while (files->len > maximum) {
-        g_ptr_array_remove_index(files, files->len - 1);
-    }
-}
-
-static void remember_location(App *app, GFile *file) {
-    if (app->recent_locations == NULL) {
-        return;
-    }
-    add_unique_file(app->recent_locations, file, 10);
-    save_config(app);
-    if (app->sidebar_store != NULL) {
-        GtkTreeIter group;
-        gboolean valid = gtk_tree_model_get_iter_first(
-            GTK_TREE_MODEL(app->sidebar_store), &group);
-        while (valid) {
-            gchar *name = NULL;
-            gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &group,
-                               SIDE_NAME, &name, -1);
-            gboolean recent_group = g_strcmp0(name, "Recent Locations") == 0;
-            g_free(name);
-            if (recent_group) {
-                GtkTreeIter child;
-                while (gtk_tree_model_iter_children(
-                           GTK_TREE_MODEL(app->sidebar_store), &child,
-                           &group)) {
-                    gtk_tree_store_remove(app->sidebar_store, &child);
-                }
-                for (guint i = 0; i < app->recent_locations->len; i++) {
-                    GFile *recent = g_ptr_array_index(app->recent_locations, i);
-                    gchar *basename = g_file_get_basename(recent);
-                    if (basename == NULL) {
-                        basename = gfm_get_path_or_uri(recent);
-                    }
-                    GtkTreeIter shortcut;
-                    gtk_tree_store_append(app->sidebar_store, &shortcut,
-                                          &group);
-                    gtk_tree_store_set(app->sidebar_store, &shortcut,
-                                       SIDE_NAME, basename, SIDE_FILE, recent,
-                                       SIDE_LOADED, TRUE, -1);
-                    g_free(basename);
-                }
-                break;
-            }
-            valid = gtk_tree_model_iter_next(
-                GTK_TREE_MODEL(app->sidebar_store), &group);
-        }
-    }
-}
-
-static void load_file_list(GKeyFile *key_file, const gchar *key,
-                           GPtrArray *files, guint maximum) {
-    gsize length = 0;
-    gchar **paths = g_key_file_get_string_list(
-        key_file, "General", key, &length, NULL);
-    for (gsize i = 0; paths != NULL && i < length && files->len < maximum;
-         i++) {
-        GFile *file = file_from_address(paths[i], NULL);
-        if (file != NULL && g_file_query_exists(file, NULL)) {
-            add_unique_file(files, file, maximum);
-        }
-        g_clear_object(&file);
-    }
-    g_strfreev(paths);
-}
-
-static void refresh_listing(App *app) {
-    gtk_list_store_clear(app->store);
-    GError *error = NULL;
-    GFileEnumerator *enumerator = g_file_enumerate_children(
-        app->location,
-        G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE ","
-        G_FILE_ATTRIBUTE_STANDARD_SIZE "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN ","
-        G_FILE_ATTRIBUTE_STANDARD_IS_SYMLINK ","
-        G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE ","
-        G_FILE_ATTRIBUTE_TIME_MODIFIED,
-        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
-    if (enumerator == NULL) {
-        show_error(app, "Could not read this location.", error);
-        g_clear_error(&error);
-        return;
-    }
-
-    gchar *query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(app->search)),
-                                   -1);
-    guint video_thumbnail_jobs = 0;
-    GFileInfo *info;
-    while ((info = g_file_enumerator_next_file(enumerator, NULL, &error)) !=
-           NULL) {
-        const gchar *name = g_file_info_get_name(info);
-        gboolean hidden = g_file_info_get_is_hidden(info) ||
-                          is_hidden_name(name);
-        if (hidden && !app->show_hidden) {
-            g_object_unref(info);
-            continue;
-        }
-        gchar *folded = g_utf8_casefold(name, -1);
-        gboolean matches = query[0] == '\0' || strstr(folded, query) != NULL;
-        g_free(folded);
-        if (matches) {
-            GFile *file = g_file_get_child(app->location, name);
-            GFileType type = g_file_info_get_file_type(info);
-            gboolean directory = type == G_FILE_TYPE_DIRECTORY;
-            gboolean needs_video_thumbnail = FALSE;
-            GdkPixbuf *preview = load_file_preview(
-                file, info, &needs_video_thumbnail);
-            const gchar *type_name = directory ? "Folder" :
-                                     type == G_FILE_TYPE_SYMBOLIC_LINK ? "Link" :
-                                     type == G_FILE_TYPE_REGULAR ? "File" :
-                                     "Other";
-            gchar *size = format_size(g_file_info_get_size(info), directory);
-            GtkTreeIter iter;
-            gtk_list_store_append(app->store, &iter);
-            gtk_list_store_set(app->store, &iter, COL_NAME, name, COL_TYPE,
-                               type_name, COL_SIZE, size, COL_FILE, file,
-                               COL_PREVIEW, preview, -1);
-            if (needs_video_thumbnail && video_thumbnail_jobs < 12) {
-                schedule_video_thumbnail(app->store, file, &iter);
-                video_thumbnail_jobs++;
-            }
-            g_clear_object(&preview);
-            g_free(size);
-            g_object_unref(file);
-        }
-        g_object_unref(info);
-    }
-    if (error != NULL) {
-        show_error(app, "An error occurred while reading this location.",
-                   error);
-        g_clear_error(&error);
-    }
-    g_free(query);
-    g_object_unref(enumerator);
-    update_navigation(app);
-}
-
-static gboolean go_to(App *app, GFile *file, gboolean add_history) {
-    GError *error = NULL;
-    GFileInfo *info = g_file_query_info(
-        file, G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NONE, NULL,
-        &error);
-    if (info == NULL || g_file_info_get_file_type(info) != G_FILE_TYPE_DIRECTORY) {
-        if (info != NULL) {
-            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY,
-                                "The location is not a directory.");
-            g_object_unref(info);
-        }
-        show_error(app, "Cannot open location.", error);
-        g_clear_error(&error);
-        return FALSE;
-    }
-    g_object_unref(info);
-
-    g_set_object(&app->location, file);
-    if (add_history) {
-        while (app->history->len > app->history_index + 1) {
-            g_ptr_array_remove_index(app->history, app->history->len - 1);
-        }
-        g_ptr_array_add(app->history, g_object_ref(file));
-        app->history_index = app->history->len - 1;
-    }
-    gchar *path = g_file_get_path(file);
-    if (path == NULL) {
-        path = g_file_get_uri(file);
-    }
-    gtk_entry_set_text(GTK_ENTRY(app->address), path);
-    g_free(path);
-    refresh_listing(app);
-    remember_location(app, file);
+    if (!md5) return FALSE;
+    g_snprintf(out, outsz, "%s/%s.png", dir, md5);
+    g_free(md5);
     return TRUE;
 }
 
-static void on_row_activated(GtkTreeView *view, GtkTreePath *path,
-                             GtkTreeViewColumn *column, gpointer data) {
-    (void)view;
-    (void)column;
-    App *app = data;
-    GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->store), &iter, path)) {
-        return;
+static gboolean spawn_ok_sync(char **argv) {
+    gint status = 1;
+    GError *err = NULL;
+    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                      NULL, NULL, NULL, NULL, &status, &err)) {
+        if (err) g_error_free(err);
+        return FALSE;
     }
-    GFile *file = NULL;
-    gtk_tree_model_get(GTK_TREE_MODEL(app->store), &iter, COL_FILE, &file, -1);
-    GError *error = NULL;
-    GFileInfo *info = g_file_query_info(
-        file, G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NONE, NULL,
-        &error);
-    if (info != NULL && g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
-        go_to(app, file, TRUE);
-    } else {
-        gchar *uri = g_file_get_uri(file);
-        g_app_info_launch_default_for_uri(uri, NULL, &error);
-        g_free(uri);
-    }
-    if (error != NULL) {
-        show_error(app, "Could not open this item.", error);
-        g_clear_error(&error);
-    }
-    g_clear_object(&info);
-    g_object_unref(file);
+    if (err) g_error_free(err);
+    return status == 0;
 }
 
-static void on_icon_item_activated(GtkIconView *view, GtkTreePath *path,
-                                   gpointer data) {
-    App *app = data;
-    gtk_icon_view_unselect_all(view);
-    gtk_icon_view_select_path(view, path);
-    open_selected(app);
-}
-
-static GFile *selected_file(App *app) {
-    GtkTreeModel *model = NULL;
-    GtkTreeIter iter;
-    if (gtk_stack_get_visible_child(GTK_STACK(app->view_stack)) ==
-        app->icon_view) {
-        GList *selected = gtk_icon_view_get_selected_items(
-            GTK_ICON_VIEW(app->icon_view));
-        if (selected == NULL) {
-            return NULL;
-        }
-        model = GTK_TREE_MODEL(app->store);
-        gboolean found = gtk_tree_model_get_iter(
-            model, &iter, selected->data);
-        g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
-        if (!found) {
-            return NULL;
-        }
-    } else {
-        GtkTreeSelection *selection = gtk_tree_view_get_selection(
-            GTK_TREE_VIEW(app->view));
-        if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
-            return NULL;
-        }
-    }
-    GFile *file = NULL;
-    gtk_tree_model_get(model, &iter, COL_FILE, &file, -1);
-    return file;
-}
-
-static void copy_job_free(gpointer data) {
-    CopyJob *job = data;
-    g_clear_object(&job->source);
-    g_clear_object(&job->destination_directory);
-    g_free(job);
-}
-
-static void copy_progress_changed(goffset current, goffset total,
-                                  gpointer user_data) {
-    App *app = user_data;
-    g_mutex_lock(&app->copy_mutex);
-    while (app->copy_paused && !app->shutting_down) {
-        g_cond_wait(&app->copy_condition, &app->copy_mutex);
-    }
-    if (total > 0) {
-        app->copy_fraction = CLAMP((gdouble)current / (gdouble)total, 0.0, 1.0);
-    } else {
-        app->copy_fraction = 0.0;
-    }
-    g_mutex_unlock(&app->copy_mutex);
-}
-
-static gpointer copy_worker(gpointer user_data) {
-    App *app = user_data;
-    for (;;) {
-        g_mutex_lock(&app->copy_mutex);
-        while (g_queue_is_empty(app->copy_queue) && !app->shutting_down) {
-            g_cond_wait(&app->copy_condition, &app->copy_mutex);
-        }
-        if (app->shutting_down) {
-            g_mutex_unlock(&app->copy_mutex);
-            break;
-        }
-        CopyJob *job = g_queue_pop_head(app->copy_queue);
-        g_free(app->copy_current_path);
-        app->copy_current_path = gfm_get_path_or_uri(job->source);
-        app->copy_fraction = 0.0;
-        g_mutex_unlock(&app->copy_mutex);
-
-        GError *error = NULL;
-        gfm_copy_to_directory_full(
-            job->source, job->destination_directory, app->copy_cancellable,
-            copy_progress_changed, app, &error);
-        if (error != NULL) {
-            g_mutex_lock(&app->copy_mutex);
-            if (app->copy_error == NULL) {
-                app->copy_error = g_strdup(error->message);
-            }
-            g_mutex_unlock(&app->copy_mutex);
-            g_error_free(error);
-        }
-        copy_job_free(job);
-        g_mutex_lock(&app->copy_mutex);
-        if (g_queue_is_empty(app->copy_queue)) {
-            app->copy_running = FALSE;
-            app->copy_paused = FALSE;
-        }
-        g_mutex_unlock(&app->copy_mutex);
-    }
-    return NULL;
-}
-
-static gboolean on_copy_window_delete(GtkWidget *widget, GdkEvent *event,
-                                      gpointer user_data) {
-    (void)event;
-    (void)user_data;
-    gtk_widget_hide(widget);
-    return TRUE;
-}
-
-static void on_copy_pause_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
-    App *app = user_data;
-    g_mutex_lock(&app->copy_mutex);
-    gboolean running = app->copy_running;
-    if (running) {
-        app->copy_paused = !app->copy_paused;
-        g_cond_broadcast(&app->copy_condition);
-    }
-    gboolean paused = app->copy_paused;
-    g_mutex_unlock(&app->copy_mutex);
-    if (!running) {
-        if (app->copy_timer != 0) {
-            g_source_remove(app->copy_timer);
-            app->copy_timer = 0;
-        }
-        gtk_widget_destroy(app->copy_window);
-        app->copy_window = NULL;
-        app->copy_label = NULL;
-        app->copy_progress = NULL;
-        app->copy_pause_button = NULL;
-    } else {
-        gtk_button_set_label(GTK_BUTTON(app->copy_pause_button),
-                             paused ? "Resume" : "Pause");
-    }
-}
-
-static gboolean update_copy_window(gpointer user_data) {
-    App *app = user_data;
-    g_mutex_lock(&app->copy_mutex);
-    gboolean running = app->copy_running;
-    gboolean paused = app->copy_paused;
-    guint queued = g_queue_get_length(app->copy_queue);
-    gdouble fraction = app->copy_fraction;
-    gchar *current_path = g_strdup(app->copy_current_path);
-    gchar *error = !running ? g_steal_pointer(&app->copy_error) : NULL;
-    g_mutex_unlock(&app->copy_mutex);
-
-    if (!running) {
-        gtk_label_set_text(GTK_LABEL(app->copy_label),
-                           error == NULL ? "All queued copies complete."
-                                         : "Copy queue finished with errors.");
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->copy_progress),
-                                      error == NULL ? 1.0 : fraction);
-        gtk_button_set_label(GTK_BUTTON(app->copy_pause_button), "Close");
-        if (app->window != NULL) {
-            refresh_listing(app);
-        }
-        if (error != NULL) {
-            GError *copy_error = g_error_new_literal(
-                G_IO_ERROR, G_IO_ERROR_FAILED, error);
-            show_error(app, "One or more copies failed.", copy_error);
-            g_error_free(copy_error);
-            g_free(error);
-        }
-        g_free(current_path);
-        app->copy_timer = 0;
-        return G_SOURCE_REMOVE;
-    }
-
-    gchar *basename = current_path != NULL
-                          ? g_path_get_basename(current_path)
-                          : g_strdup("item");
-    gchar *label = queued > 0
-                       ? g_strdup_printf("%s %s (%u queued)",
-                                         paused ? "Paused:" : "Copying",
-                                         basename, queued)
-                       : g_strdup_printf("%s %s",
-                                         paused ? "Paused:" : "Copying",
-                                         basename);
-    gtk_label_set_text(GTK_LABEL(app->copy_label), label);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->copy_progress),
-                                  fraction);
-    gtk_button_set_label(GTK_BUTTON(app->copy_pause_button),
-                         paused ? "Resume" : "Pause");
-    g_free(label);
-    g_free(basename);
-    g_free(current_path);
-    return G_SOURCE_CONTINUE;
-}
-
-static void show_copy_window(App *app) {
-    if (app->copy_window == NULL) {
-        app->copy_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-        gtk_window_set_title(GTK_WINDOW(app->copy_window), "Copy Progress");
-        gtk_window_set_transient_for(GTK_WINDOW(app->copy_window),
-                                     GTK_WINDOW(app->window));
-        gtk_window_set_default_size(GTK_WINDOW(app->copy_window), 360, -1);
-        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-        gtk_container_set_border_width(GTK_CONTAINER(box), 12);
-        gtk_container_add(GTK_CONTAINER(app->copy_window), box);
-        app->copy_label = gtk_label_new("Preparing queued copies…");
-        gtk_label_set_xalign(GTK_LABEL(app->copy_label), 0.0f);
-        gtk_box_pack_start(GTK_BOX(box), app->copy_label, FALSE, FALSE, 0);
-        app->copy_progress = gtk_progress_bar_new();
-        gtk_box_pack_start(GTK_BOX(box), app->copy_progress, FALSE, FALSE, 0);
-        app->copy_pause_button = gtk_button_new_with_label("Pause");
-        gtk_widget_set_halign(app->copy_pause_button, GTK_ALIGN_END);
-        gtk_box_pack_start(GTK_BOX(box), app->copy_pause_button, FALSE, FALSE,
-                           0);
-        g_signal_connect(app->copy_pause_button, "clicked",
-                         G_CALLBACK(on_copy_pause_clicked), app);
-        g_signal_connect(app->copy_window, "delete-event",
-                         G_CALLBACK(on_copy_window_delete), app);
-    }
-    gtk_widget_show_all(app->copy_window);
-    gtk_window_present(GTK_WINDOW(app->copy_window));
-    if (app->copy_timer == 0) {
-        app->copy_timer = g_timeout_add(100, update_copy_window, app);
-    }
-}
-
-static void queue_copy(App *app, GFile *source, GFile *destination_directory) {
-    CopyJob *job = g_new0(CopyJob, 1);
-    job->source = g_object_ref(source);
-    job->destination_directory = g_object_ref(destination_directory);
-    g_mutex_lock(&app->copy_mutex);
-    g_queue_push_tail(app->copy_queue, job);
-    app->copy_running = TRUE;
-    g_cond_signal(&app->copy_condition);
-    g_mutex_unlock(&app->copy_mutex);
-    show_copy_window(app);
-}
-
-static gint ask_confirm(App *app, const gchar *message, const gchar *detail) {
-    GtkWidget *dialog = gtk_message_dialog_new(
-        GTK_WINDOW(app->window), GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
-        GTK_BUTTONS_CANCEL, "%s", message);
-    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "%s",
-                                             detail);
-    gtk_dialog_add_button(GTK_DIALOG(dialog), "Continue", GTK_RESPONSE_ACCEPT);
-    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
-    return response;
-}
-
-static gchar *ask_text(App *app, const gchar *title, const gchar *prompt,
-                       const gchar *initial) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons(
-        title, GTK_WINDOW(app->window), GTK_DIALOG_MODAL, "_Cancel",
-        GTK_RESPONSE_CANCEL, "_OK", GTK_RESPONSE_ACCEPT, NULL);
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *label = gtk_label_new(prompt);
-    GtkWidget *entry = gtk_entry_new();
-    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
-    gtk_entry_set_text(GTK_ENTRY(entry), initial != NULL ? initial : "");
-    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
-    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 6);
-    gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 6);
-    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
-    gtk_widget_show_all(dialog);
-    gchar *result = NULL;
-    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-        result = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
-    }
-    gtk_widget_destroy(dialog);
-    return result;
-}
-
-static void create_item(App *app, gboolean directory) {
-    gchar *name = ask_text(app, directory ? "New Folder" : "New File",
-                           directory ? "Folder name:" : "File name:", NULL);
-    if (name == NULL) {
-        return;
-    }
-    GError *error = NULL;
-    gboolean success = directory
-                           ? gfm_create_directory(app->location, name, &error)
-                           : gfm_create_file(app->location, name, &error);
-    if (!success) {
-        show_error(app, directory ? "Could not create folder."
-                                  : "Could not create file.",
-                   error);
-        g_clear_error(&error);
-    } else {
-        refresh_listing(app);
-    }
-    g_free(name);
-}
-
-static void show_properties(App *app, GFile *file) {
-    GError *error = NULL;
-    GFileInfo *info = g_file_query_info(
-        file, G_FILE_ATTRIBUTE_STANDARD_TYPE ","
-             G_FILE_ATTRIBUTE_STANDARD_SIZE ","
-             G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE ","
-             G_FILE_ATTRIBUTE_TIME_MODIFIED ","
-             G_FILE_ATTRIBUTE_UNIX_MODE,
-        G_FILE_QUERY_INFO_NONE, NULL, &error);
-    if (info == NULL) {
-        show_error(app, "Could not read item properties.", error);
-        g_clear_error(&error);
-        return;
-    }
-
-    gchar *path = gfm_get_path_or_uri(file);
-    const gchar *content_type = g_file_info_get_content_type(info);
-    gchar *type = content_type != NULL
-                      ? g_content_type_get_description(content_type)
-                      : NULL;
-    if (type == NULL) {
-        type = g_strdup(g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY
-                            ? "Folder"
-                            : "File");
-    }
-    gchar *size = g_format_size(g_file_info_get_size(info));
-    GDateTime *modified = g_date_time_new_from_unix_local(
-        (gint64)g_file_info_get_attribute_uint64(
-            info, G_FILE_ATTRIBUTE_TIME_MODIFIED));
-    gchar *modified_text = modified != NULL
-                               ? g_date_time_format(modified, "%c")
-                               : g_strdup("Unknown");
-    gchar *details = g_strdup_printf(
-        "Location: %s\nType: %s\nSize: %s\nModified: %s",
-        path, type, size, modified_text);
-    GtkWidget *dialog = gtk_dialog_new_with_buttons(
-        "Properties", GTK_WINDOW(app->window), GTK_DIALOG_MODAL,
-        "_Close", GTK_RESPONSE_CLOSE, "_Apply Permissions",
-        GTK_RESPONSE_ACCEPT, NULL);
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
-    gtk_box_pack_start(GTK_BOX(content), box, TRUE, TRUE, 0);
-    GtkWidget *label = gtk_label_new(details);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
-    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
-
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-    gtk_box_pack_start(GTK_BOX(box), grid, FALSE, FALSE, 0);
-    const gchar *classes[] = {"Owner", "Group", "Other"};
-    const gchar *permissions[] = {"Read", "Write", "Execute"};
-    const guint32 bits[][3] = {
-        {S_IRUSR, S_IWUSR, S_IXUSR},
-        {S_IRGRP, S_IWGRP, S_IXGRP},
-        {S_IROTH, S_IWOTH, S_IXOTH}
+static gboolean generate_video_thumbnail(const char *path, const char *thumb_path) {
+    gchar *argv[] = {
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", "1", "-i", (gchar *)path,
+        "-frames:v", "1",
+        "-vf", "scale=256:256:force_original_aspect_ratio=decrease",
+        (gchar *)thumb_path,
+        NULL
     };
-    GtkWidget *checks[3][3] = {{NULL}};
-    guint32 mode = g_file_info_get_attribute_uint32(
-        info, G_FILE_ATTRIBUTE_UNIX_MODE);
-    for (guint column = 0; column < 3; column++) {
-        GtkWidget *heading = gtk_label_new(classes[column]);
-        gtk_grid_attach(GTK_GRID(grid), heading, (gint)column + 1, 0, 1, 1);
-    }
-    for (guint row = 0; row < 3; row++) {
-        GtkWidget *heading = gtk_label_new(permissions[row]);
-        gtk_widget_set_halign(heading, GTK_ALIGN_START);
-        gtk_grid_attach(GTK_GRID(grid), heading, 0, (gint)row + 1, 1, 1);
-        for (guint column = 0; column < 3; column++) {
-            checks[row][column] = gtk_check_button_new();
-            gtk_toggle_button_set_active(
-                GTK_TOGGLE_BUTTON(checks[row][column]),
-                (mode & bits[column][row]) != 0);
-            gtk_grid_attach(GTK_GRID(grid), checks[row][column],
-                            (gint)column + 1, (gint)row + 1, 1, 1);
-        }
-    }
-    gboolean supports_permissions = g_file_info_has_attribute(
-        info, G_FILE_ATTRIBUTE_UNIX_MODE);
-    gtk_widget_set_sensitive(grid, supports_permissions);
-    if (!supports_permissions) {
-        GtkWidget *notice = gtk_label_new(
-            "This location does not expose editable Unix permissions.");
-        gtk_box_pack_start(GTK_BOX(box), notice, FALSE, FALSE, 0);
-        gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT,
-                                          FALSE);
-    }
-    gtk_widget_show_all(dialog);
-    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-        guint32 updated_mode = mode & ~0777U;
-        for (guint column = 0; column < 3; column++) {
-            for (guint row = 0; row < 3; row++) {
-                if (gtk_toggle_button_get_active(
-                        GTK_TOGGLE_BUTTON(checks[row][column]))) {
-                    updated_mode |= bits[column][row];
-                }
-            }
-        }
-        if (!gfm_set_permissions(file, updated_mode, &error)) {
-            show_error(app, "Could not update permissions.", error);
-            g_clear_error(&error);
-        } else {
-            refresh_listing(app);
-        }
-    }
-    gtk_widget_destroy(dialog);
-    g_free(path);
-    g_free(type);
-    g_free(size);
-    g_free(modified_text);
-    g_free(details);
-    g_clear_pointer(&modified, g_date_time_unref);
-    g_object_unref(info);
+    if (!spawn_ok_sync(argv)) return FALSE;
+    return g_file_test(thumb_path, G_FILE_TEST_EXISTS);
 }
 
-static void do_operation(App *app, const gchar *operation) {
-    GFile *source = selected_file(app);
-    if (source == NULL) {
-        show_error(app, "Select an item first.", NULL);
-        return;
-    }
-    GError *error = NULL;
-    gboolean success = FALSE;
-    if (g_str_equal(operation, "rename")) {
-        gchar *old_name = g_file_get_basename(source);
-        gchar *new_name = ask_text(app, "Rename", "New name:", old_name);
-        if (new_name != NULL && gfm_name_is_safe(new_name)) {
-            if (ask_confirm(app, "Rename selected item?",
-                            "This changes the item's name.") ==
-                GTK_RESPONSE_ACCEPT) {
-                success = gfm_rename(source, new_name, &error);
-            }
-        } else if (new_name != NULL) {
-            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-                                "Enter a single file name without path separators.");
-        }
-        g_free(new_name);
-        g_free(old_name);
-    } else if (g_str_equal(operation, "copy") ||
-               g_str_equal(operation, "move")) {
-        gchar *path = ask_text(app, g_str_equal(operation, "copy") ? "Copy" : "Move",
-                               "Destination directory:", NULL);
-        if (path != NULL && path[0] != '\0') {
-            GFile *destination = file_from_address(path, app->location);
-            if (ask_confirm(app, g_str_equal(operation, "copy") ?
-                                "Copy selected item?" : "Move selected item?",
-                            path) == GTK_RESPONSE_ACCEPT) {
-                if (g_str_equal(operation, "copy")) {
-                    queue_copy(app, source, destination);
-                    success = TRUE;
-                } else {
-                    success = gfm_move_to_directory(source, destination,
-                                                    &error);
-                }
-            }
-            g_object_unref(destination);
-        }
-        g_free(path);
-    } else if (g_str_equal(operation, "trash")) {
-        if (ask_confirm(app, "Move selected item to Trash?",
-                        "The item can usually be restored from Trash.") ==
-            GTK_RESPONSE_ACCEPT) {
-            success = gfm_trash(source, &error);
-        }
-    } else if (g_str_equal(operation, "delete")) {
-        if (ask_confirm(app, "Permanently delete selected item?",
-                        "This cannot be undone.") == GTK_RESPONSE_ACCEPT) {
-            success = gfm_delete(source, &error);
-        }
-    }
-    if (error != NULL) {
-        show_error(app, "File operation failed.", error);
-        g_clear_error(&error);
-    } else if (success) {
-        refresh_listing(app);
-    }
-    g_object_unref(source);
-}
-
-static void on_operation_clicked(GtkButton *button, gpointer data) {
-    do_operation(data, g_object_get_data(G_OBJECT(button), "operation"));
-}
-
-static void clipboard_file_free(gpointer data) {
-    ClipboardFile *clipboard_file = data;
-    g_clear_object(&clipboard_file->file);
-    g_free(clipboard_file);
-}
-
-static void clipboard_get_data(GtkClipboard *clipboard,
-                               GtkSelectionData *selection_data,
-                               guint info, gpointer data) {
-    (void)clipboard;
-    ClipboardFile *clipboard_file = data;
-    gchar *uri = g_file_get_uri(clipboard_file->file);
-    gchar *contents = info == 0
-                          ? g_strdup_printf("%s\n%s\n",
-                                            clipboard_file->move ? "cut" :
-                                                                   "copy",
-                                            uri)
-                          : g_strdup_printf("%s\r\n", uri);
-    gtk_selection_data_set(selection_data,
-                           gtk_selection_data_get_target(selection_data), 8,
-                           (const guchar *)contents, (gint)strlen(contents));
-    g_free(contents);
-    g_free(uri);
-}
-
-static void clipboard_clear_data(GtkClipboard *clipboard, gpointer data) {
-    (void)clipboard;
-    clipboard_file_free(data);
-}
-
-static void set_file_clipboard(App *app, gboolean move) {
-    GFile *file = selected_file(app);
-    if (file == NULL) {
-        return;
-    }
-    static GtkTargetEntry targets[] = {
-        {(gchar *)"x-special/gnome-copied-files", 0, 0},
-        {(gchar *)"text/uri-list", 0, 1}
+static gboolean generate_pdf_thumbnail(const char *path, const char *thumb_path) {
+    char prefix[PATH_MAX];
+    g_snprintf(prefix, sizeof(prefix), "%s.pdf", thumb_path);
+    gchar *argv1[] = {
+        "pdftoppm", "-f", "1", "-singlefile", "-png",
+        "-scale-to", "256", (gchar *)path, prefix, NULL
     };
-    ClipboardFile *clipboard_file = g_new0(ClipboardFile, 1);
-    clipboard_file->file = file;
-    clipboard_file->move = move;
-    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    if (!gtk_clipboard_set_with_data(clipboard, targets, G_N_ELEMENTS(targets),
-                                     clipboard_get_data,
-                                     clipboard_clear_data, clipboard_file)) {
-        clipboard_file_free(clipboard_file);
+    char out1[PATH_MAX];
+    g_snprintf(out1, sizeof(out1), "%s.png", prefix);
+    if (spawn_ok_sync(argv1) && g_file_test(out1, G_FILE_TEST_EXISTS)) {
+        if (rename(out1, thumb_path) == 0) return TRUE;
+        unlink(out1);
     }
-}
-
-static gboolean paste_uri_list(App *app, const gchar *contents,
-                               gboolean move, GFile *destination_directory) {
-    GPtrArray *files = gfm_parse_uri_list(contents, &move);
-    if (files == NULL) {
-        return FALSE;
-    }
-    gboolean changed = FALSE;
-    GError *error = NULL;
-    for (guint i = 0; i < files->len; i++) {
-        GFile *source = g_ptr_array_index(files, i);
-        gboolean success;
-        if (move) {
-            success = gfm_move_to_directory(source, destination_directory,
-                                             &error);
-        } else {
-            queue_copy(app, source, destination_directory);
-            success = TRUE;
-        }
-        if (!success) {
-            break;
-        }
-        changed = TRUE;
-    }
-    g_ptr_array_unref(files);
-    if (error != NULL) {
-        show_error(app, "Could not paste the selected item.", error);
-        g_clear_error(&error);
-    } else if (changed) {
-        refresh_listing(app);
-    }
-    return changed;
-}
-
-static void paste_clipboard(App *app) {
-    GFile *destination = NULL;
-    GFile *selection = selected_file(app);
-    if (selection != NULL &&
-        g_file_query_file_type(selection, G_FILE_QUERY_INFO_NONE, NULL) ==
-            G_FILE_TYPE_DIRECTORY) {
-        destination = g_object_ref(selection);
-    } else {
-        destination = g_object_ref(app->location);
-    }
-    g_clear_object(&selection);
-
-    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    GdkAtom gnome_target =
-        gdk_atom_intern_static_string("x-special/gnome-copied-files");
-    GtkSelectionData *selection_data =
-        gtk_clipboard_wait_for_contents(clipboard, gnome_target);
-    if (selection_data == NULL) {
-        selection_data = gtk_clipboard_wait_for_contents(
-            clipboard, gdk_atom_intern_static_string("text/uri-list"));
-    }
-    if (selection_data != NULL) {
-        gint length = gtk_selection_data_get_length(selection_data);
-        const guchar *bytes = gtk_selection_data_get_data(selection_data);
-        if (length > 0 && bytes != NULL) {
-            gchar *contents = g_strndup((const gchar *)bytes, (gsize)length);
-            paste_uri_list(app, contents, FALSE, destination);
-            g_free(contents);
-        }
-        gtk_selection_data_free(selection_data);
-    }
-    g_object_unref(destination);
-}
-
-static void open_selected(App *app) {
-    GFile *file = selected_file(app);
-    if (file == NULL) {
-        return;
-    }
-    GError *error = NULL;
-    if (g_file_query_file_type(file, G_FILE_QUERY_INFO_NONE, NULL) ==
-        G_FILE_TYPE_DIRECTORY) {
-        go_to(app, file, TRUE);
-    } else {
-        gchar *uri = g_file_get_uri(file);
-        g_app_info_launch_default_for_uri(uri, NULL, &error);
-        g_free(uri);
-    }
-    if (error != NULL) {
-        show_error(app, "Could not open the selected item.", error);
-        g_clear_error(&error);
-    }
-    g_object_unref(file);
-}
-
-static void copy_selected_path(App *app) {
-    GFile *file = selected_file(app);
-    if (file == NULL) {
-        return;
-    }
-    gchar *path = gfm_get_path_or_uri(file);
-    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    gtk_clipboard_set_text(clipboard, path, -1);
-    gtk_clipboard_store(clipboard);
-    g_free(path);
-    g_object_unref(file);
-}
-
-static void on_file_context_action(GtkMenuItem *item, gpointer data) {
-    App *app = data;
-    const gchar *action = g_object_get_data(G_OBJECT(item), "action");
-    if (g_str_equal(action, "open")) {
-        open_selected(app);
-    } else if (g_str_equal(action, "properties")) {
-        GFile *file = selected_file(app);
-        if (file != NULL) {
-            show_properties(app, file);
-            g_object_unref(file);
-        }
-    } else if (g_str_equal(action, "new-file")) {
-        create_item(app, FALSE);
-    } else if (g_str_equal(action, "new-folder")) {
-        create_item(app, TRUE);
-    } else if (g_str_equal(action, "copy-path")) {
-        copy_selected_path(app);
-    } else if (g_str_equal(action, "copy-clipboard")) {
-        set_file_clipboard(app, FALSE);
-    } else if (g_str_equal(action, "cut")) {
-        set_file_clipboard(app, TRUE);
-    } else if (g_str_equal(action, "paste")) {
-        paste_clipboard(app);
-    } else if (g_str_equal(action, "copy") || g_str_equal(action, "move") ||
-               g_str_equal(action, "rename") ||
-               g_str_equal(action, "trash") ||
-               g_str_equal(action, "delete")) {
-        do_operation(app, action);
-    }
-}
-
-static void append_context_item(GtkWidget *menu, const gchar *label,
-                                const gchar *action, App *app) {
-    GtkWidget *item = gtk_menu_item_new_with_label(label);
-    g_object_set_data(G_OBJECT(item), "action", (gpointer)action);
-    g_signal_connect(item, "activate", G_CALLBACK(on_file_context_action),
-                     app);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-}
-
-static gboolean on_file_button_press(GtkWidget *widget, GdkEventButton *event,
-                                     gpointer data) {
-    if (event->type != GDK_BUTTON_PRESS || event->button != GDK_BUTTON_SECONDARY) {
-        return FALSE;
-    }
-    App *app = data;
-    GtkTreePath *path = NULL;
-    if (widget == app->icon_view) {
-        path = gtk_icon_view_get_path_at_pos(GTK_ICON_VIEW(widget),
-                                             (gint)event->x, (gint)event->y);
-        if (path != NULL) {
-            gtk_icon_view_unselect_all(GTK_ICON_VIEW(widget));
-            gtk_icon_view_select_path(GTK_ICON_VIEW(widget), path);
-            gtk_tree_path_free(path);
-        } else {
-            gtk_icon_view_unselect_all(GTK_ICON_VIEW(widget));
-        }
-    } else if (gtk_tree_view_get_path_at_pos(
-                   GTK_TREE_VIEW(widget), (gint)event->x, (gint)event->y,
-                   &path, NULL, NULL, NULL)) {
-        GtkTreeSelection *selection = gtk_tree_view_get_selection(
-            GTK_TREE_VIEW(widget));
-        gtk_tree_selection_select_path(selection, path);
-        gtk_tree_path_free(path);
-    } else {
-        gtk_tree_selection_unselect_all(
-            gtk_tree_view_get_selection(GTK_TREE_VIEW(widget)));
-    }
-    GtkWidget *menu = gtk_menu_new();
-    GFile *selected = selected_file(app);
-    gboolean has_selection = selected != NULL;
-    g_clear_object(&selected);
-    if (has_selection) {
-        append_context_item(menu, "Open", "open", app);
-        append_context_item(menu, "Copy Path", "copy-path", app);
-        append_context_item(menu, "Copy", "copy-clipboard", app);
-        append_context_item(menu, "Cut", "cut", app);
-        append_context_item(menu, "Properties", "properties", app);
-    } else {
-        append_context_item(menu, "New Folder…", "new-folder", app);
-        append_context_item(menu, "New File…", "new-file", app);
-    }
-    append_context_item(menu, "Paste", "paste", app);
-    if (has_selection) {
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
-                              gtk_separator_menu_item_new());
-        append_context_item(menu, "Copy to…", "copy", app);
-        append_context_item(menu, "Move to…", "move", app);
-        append_context_item(menu, "Rename…", "rename", app);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu),
-                              gtk_separator_menu_item_new());
-        append_context_item(menu, "Move to Trash", "trash", app);
-        append_context_item(menu, "Delete Permanently…", "delete", app);
-    }
-    gtk_widget_show_all(menu);
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-    return TRUE;
-}
-
-static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event,
-                                    gpointer data) {
-    (void)widget;
-    App *app = data;
-    GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
-    gboolean control = (modifiers & GDK_CONTROL_MASK) != 0;
-    gboolean shift = (modifiers & GDK_SHIFT_MASK) != 0;
-    gboolean alt = (modifiers & GDK_MOD1_MASK) != 0;
-    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(app->window));
-    gboolean list_focused = focus == app->view || focus == app->icon_view;
-
-    if (control && event->keyval == GDK_KEY_l) {
-        gtk_widget_grab_focus(app->address);
-        gtk_editable_select_region(GTK_EDITABLE(app->address), 0, -1);
-        return TRUE;
-    }
-    if (control && event->keyval == GDK_KEY_h) {
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hidden_button),
-                                     !app->show_hidden);
-        return TRUE;
-    }
-    if (control && (event->keyval == GDK_KEY_1 ||
-                    event->keyval == GDK_KEY_2)) {
-        app->icon_mode = event->keyval == GDK_KEY_2;
-        gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack),
-                                         app->icon_mode ? "icons" : "list");
-        save_config(app);
-        return TRUE;
-    }
-    if (control && event->keyval == GDK_KEY_n) {
-        create_item(app, shift);
-        return TRUE;
-    }
-    if (alt && event->keyval == GDK_KEY_Left) {
-        on_back(NULL, app);
-        return TRUE;
-    }
-    if (alt && event->keyval == GDK_KEY_Right) {
-        on_forward(NULL, app);
-        return TRUE;
-    }
-    if (alt && event->keyval == GDK_KEY_Up) {
-        on_up(NULL, app);
-        return TRUE;
-    }
-    if (!list_focused) {
-        return FALSE;
-    }
-    if (control && event->keyval == GDK_KEY_c) {
-        set_file_clipboard(app, FALSE);
-        return TRUE;
-    }
-    if (control && event->keyval == GDK_KEY_x) {
-        set_file_clipboard(app, TRUE);
-        return TRUE;
-    }
-    if (control && event->keyval == GDK_KEY_v) {
-        paste_clipboard(app);
-        return TRUE;
-    }
-    if (event->keyval == GDK_KEY_F2) {
-        do_operation(app, "rename");
-        return TRUE;
-    }
-    if (event->keyval == GDK_KEY_Delete) {
-        do_operation(app, shift ? "delete" : "trash");
-        return TRUE;
-    }
+    /* fallback: mutool draw */
+    gchar *argv2[] = {
+        "mutool", "draw", "-o", (gchar *)thumb_path, "-w", "256", "-h", "256", "-F", "png", (gchar *)path, "1", NULL
+    };
+    if (spawn_ok_sync(argv2) && g_file_test(thumb_path, G_FILE_TEST_EXISTS)) return TRUE;
     return FALSE;
 }
 
-static void on_back(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    if (app->history_index > 0) {
-        app->history_index--;
-        go_to(app, g_ptr_array_index(app->history, app->history_index), FALSE);
+static gboolean generate_office_thumbnail(const char *path, const char *thumb_path) {
+    char tmpdir[] = "/tmp/opencode/gfmofficeXXXXXX";
+    if (!g_mkdtemp(tmpdir)) return FALSE;
+    gchar *argv[] = {
+        "soffice", "--headless", "--nologo", "--nolockcheck", "--nodefault", "--norestore",
+        "--convert-to", "png", "--outdir", tmpdir, (gchar *)path, NULL
+    };
+    gboolean ok = spawn_ok_sync(argv);
+    char *base = g_path_get_basename(path);
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    char outpng[PATH_MAX];
+    g_snprintf(outpng, sizeof(outpng), "%s/%s.png", tmpdir, base);
+    g_free(base);
+    if (ok && g_file_test(outpng, G_FILE_TEST_EXISTS)) {
+        GError *err = NULL;
+        GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale(outpng, 256, 256, TRUE, &err);
+        if (!pb) { g_clear_error(&err); pb = gdk_pixbuf_new_from_file(outpng, &err); }
+        if (pb) {
+            gboolean saved = gdk_pixbuf_save(pb, thumb_path, "png", &err, NULL);
+            g_object_unref(pb);
+            if (!saved) { if (err) g_error_free(err); ok = FALSE; }
+            else ok = TRUE;
+        } else {
+            if (err) g_error_free(err);
+            ok = FALSE;
+        }
+    } else {
+        ok = FALSE;
+    }
+    /* cleanup temp dir contents */
+    GDir *d = g_dir_open(tmpdir, 0, NULL);
+    if (d) {
+        const char *fn;
+        while ((fn = g_dir_read_name(d)) != NULL) {
+            char fp[PATH_MAX];
+            g_snprintf(fp, sizeof(fp), "%s/%s", tmpdir, fn);
+            unlink(fp);
+        }
+        g_dir_close(d);
+    }
+    rmdir(tmpdir);
+    return ok && g_file_test(thumb_path, G_FILE_TEST_EXISTS);
+}
+
+static void ensure_entry_thumb(App *a, Entry *e) {
+    int size = icon_thumb_size(a);
+    if (e->ftype == FT_DIR) return;
+    if (e->thumb && e->thumb_req_size == size) return;
+    if (e->thumb_failed && e->thumb_req_size == size) return;
+    if (g_thumb_load_budget <= 0) return;
+    g_thumb_load_budget--;
+
+    /* decode source pixbuf once (expensive), then rescale cheaply for zoom */
+    if (!e->thumb_pixbuf && !e->thumb_failed) {
+        if (!e->file) { e->thumb_failed = 1; e->thumb_req_size = size; return; }
+        char *path = g_file_get_path(e->file);
+        if (!path) { e->thumb_failed = 1; e->thumb_req_size = size; return; }
+        GError *err = NULL;
+        int maxs = 256;
+        GdkPixbuf *pb = NULL;
+        gboolean is_video = is_video_content_type(e->content_type);
+        gboolean is_pdf = is_pdf_entry(e);
+        gboolean is_office = is_office_entry(e);
+        gboolean is_svg = is_svg_entry(e);
+
+        char thumb_path[PATH_MAX];
+        gboolean have_thumb_path = xdg_thumbnail_path_for_file(e->file, thumb_path, sizeof(thumb_path));
+
+        if (is_video || is_pdf || is_office) {
+            if (have_thumb_path) {
+                if (!g_file_test(thumb_path, G_FILE_TEST_EXISTS)) {
+                    if (is_video) generate_video_thumbnail(path, thumb_path);
+                    else if (is_pdf) generate_pdf_thumbnail(path, thumb_path);
+                    else if (is_office) generate_office_thumbnail(path, thumb_path);
+                }
+                if (g_file_test(thumb_path, G_FILE_TEST_EXISTS)) {
+                    pb = gdk_pixbuf_new_from_file_at_scale(thumb_path, maxs, maxs, TRUE, &err);
+                    if (!pb) {
+                        g_clear_error(&err);
+                        GdkPixbuf *orig = gdk_pixbuf_new_from_file(thumb_path, &err);
+                        if (orig) {
+                            int ow = gdk_pixbuf_get_width(orig), oh = gdk_pixbuf_get_height(orig);
+                            if (ow > 0 && oh > 0) {
+                                double scale = (double)maxs / (double)(ow > oh ? ow : oh);
+                                int nw = (int)(ow * scale); if (nw < 1) nw = 1;
+                                int nh = (int)(oh * scale); if (nh < 1) nh = 1;
+                                pb = gdk_pixbuf_scale_simple(orig, nw, nh, GDK_INTERP_BILINEAR);
+                            }
+                            g_object_unref(orig);
+                        }
+                    }
+                }
+            }
+            /* Avoid slow PIL fallback for generated-preview types */
+        } else {
+            /* images (JPEG/PNG/BMP/WebP/SVG via gdk-pixbuf loaders, etc.) */
+            pb = gdk_pixbuf_new_from_file_at_scale(path, maxs, maxs, TRUE, &err);
+            if (!pb) {
+                g_clear_error(&err);
+                GdkPixbuf *orig = gdk_pixbuf_new_from_file(path, &err);
+                if (orig) {
+                    int ow = gdk_pixbuf_get_width(orig), oh = gdk_pixbuf_get_height(orig);
+                    if (ow > 0 && oh > 0) {
+                        double scale = (double)maxs / (double)(ow > oh ? ow : oh);
+                        int nw = (int)(ow * scale); if (nw < 1) nw = 1;
+                        int nh = (int)(oh * scale); if (nh < 1) nh = 1;
+                        pb = gdk_pixbuf_scale_simple(orig, nw, nh, GDK_INTERP_BILINEAR);
+                    }
+                    g_object_unref(orig);
+                }
+            }
+            /* SVG: try rsvg-convert if gdk-pixbuf loader unavailable */
+            if (!pb && is_svg) {
+                g_clear_error(&err);
+                if (have_thumb_path) {
+                    if (!g_file_test(thumb_path, G_FILE_TEST_EXISTS)) {
+                        char wh[16]; snprintf(wh, sizeof(wh), "%d", maxs);
+                        gchar *argv[] = {
+                            "rsvg-convert", "-w", wh, "-h", wh, "-a",
+                            "-o", thumb_path, (gchar *)path, NULL
+                        };
+                        spawn_ok_sync(argv);
+                    }
+                    if (g_file_test(thumb_path, G_FILE_TEST_EXISTS)) {
+                        pb = gdk_pixbuf_new_from_file_at_scale(thumb_path, maxs, maxs, TRUE, &err);
+                    }
+                }
+            }
+            /* generic slow fallback only for likely images */
+            if (!pb && (is_image_content_type(e->content_type) || is_svg)) {
+                g_clear_error(&err);
+                char tmp[] = "/tmp/opencode/gfmthumbXXXXXX.png";
+                int fd = mkstemps(tmp, 4);
+                if (fd >= 0) {
+                    close(fd);
+                    gchar *cmd = g_strdup_printf(
+                        "python3 -c \"from PIL import Image; Image.open(r'''%s''').convert('RGBA').save(r'''%s''')\" 2>/dev/null",
+                        path, tmp);
+                    int rc = system(cmd);
+                    g_free(cmd);
+                    if (rc == 0) {
+                        pb = gdk_pixbuf_new_from_file_at_scale(tmp, maxs, maxs, TRUE, &err);
+                        if (!pb) {
+                            g_clear_error(&err);
+                            GdkPixbuf *orig = gdk_pixbuf_new_from_file(tmp, &err);
+                            if (orig) {
+                                int ow = gdk_pixbuf_get_width(orig), oh = gdk_pixbuf_get_height(orig);
+                                if (ow > 0 && oh > 0) {
+                                    double scale = (double)maxs / (double)(ow > oh ? ow : oh);
+                                    int nw = (int)(ow * scale); if (nw < 1) nw = 1;
+                                    int nh = (int)(oh * scale); if (nh < 1) nh = 1;
+                                    pb = gdk_pixbuf_scale_simple(orig, nw, nh, GDK_INTERP_BILINEAR);
+                                }
+                                g_object_unref(orig);
+                            }
+                        }
+                    }
+                    unlink(tmp);
+                }
+            }
+        }
+
+        g_free(path);
+        if (!pb) { if (err) g_error_free(err); e->thumb_failed = 1; e->thumb_req_size = size; return; }
+        e->thumb_pixbuf = pb;
+    }
+
+    if (!e->thumb_pixbuf) { e->thumb_failed = 1; e->thumb_req_size = size; return; }
+
+    if (e->thumb) { XDestroyImage(e->thumb); e->thumb = NULL; e->thumb_w = e->thumb_h = 0; }
+    e->thumb_req_size = size;
+
+    GdkPixbuf *src = e->thumb_pixbuf;
+    int ow = gdk_pixbuf_get_width(src), oh = gdk_pixbuf_get_height(src);
+    double scale = (double)size / (double)(ow > oh ? ow : oh);
+    int w = (int)(ow * scale); if (w < 1) w = 1;
+    int h = (int)(oh * scale); if (h < 1) h = 1;
+    GdkPixbuf *pb = gdk_pixbuf_scale_simple(src, w, h, GDK_INTERP_BILINEAR);
+    if (!pb) { e->thumb_failed = 1; return; }
+
+    int stride = gdk_pixbuf_get_rowstride(pb);
+    int nchan = gdk_pixbuf_get_n_channels(pb);
+    guchar *px = gdk_pixbuf_get_pixels(pb);
+
+    Visual *vis = DefaultVisual(a->dpy, a->scr);
+    int depth = DefaultDepth(a->dpy, a->scr);
+    if (depth < 24) depth = 24;
+    int bpp = 32;
+    int bytes_per_line = w * 4;
+    char *data = calloc(1, (size_t)bytes_per_line * (size_t)h);
+    if (!data) { g_object_unref(pb); e->thumb_failed = 1; return; }
+
+    unsigned long rm = vis->red_mask, gm = vis->green_mask, bm = vis->blue_mask;
+    int rs=0, gs=0, bs=0;
+    if (rm) while (((rm >> rs) & 1UL) == 0UL) rs++;
+    if (gm) while (((gm >> gs) & 1UL) == 0UL) gs++;
+    if (bm) while (((bm >> bs) & 1UL) == 0UL) bs++;
+
+    for (int yy = 0; yy < h; yy++) {
+        guchar *row = px + yy * stride;
+        for (int xx = 0; xx < w; xx++) {
+            guchar r = row[xx * nchan + 0];
+            guchar g = row[xx * nchan + 1];
+            guchar b = row[xx * nchan + 2];
+            unsigned long pixel = ((unsigned long)r << rs) |
+                                  ((unsigned long)g << gs) |
+                                  ((unsigned long)b << bs);
+            memcpy(data + (yy * bytes_per_line + xx * 4), &pixel, 4);
+        }
+    }
+
+    XImage *img = XCreateImage(a->dpy, vis, (unsigned)depth, ZPixmap, 0, data, w, h, bpp, bytes_per_line);
+    g_object_unref(pb);
+    if (!img) { free(data); e->thumb_failed = 1; return; }
+
+    e->thumb = img;
+    e->thumb_w = w;
+    e->thumb_h = h;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Colour helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static void alloc_color(App *a, const char *name, XftColor *out) {
+    XftColorAllocName(a->dpy, DefaultVisual(a->dpy, a->scr),
+                      DefaultColormap(a->dpy, a->scr), name, out);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Text helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static int text_w(App *a, XftFont *f, const char *s) {
+    XGlyphInfo ext;
+    XftTextExtentsUtf8(a->dpy, f, (const FcChar8 *)s, (int)strlen(s), &ext);
+    return ext.xOff;
+}
+
+static void draw_text(App *a, XftFont *f, XftColor *c,
+                      int x, int baseline, const char *s) {
+    if (!s || !s[0]) return;
+    int len = (int)strlen(s);
+    XftDrawStringUtf8(a->draw, c, f, x, baseline,
+                      (const FcChar8 *)s, len);
+}
+
+/* clip text to fit `max_w` pixels, appending "…" if needed */
+static void draw_text_clip(App *a, XftFont *f, XftColor *c,
+                           int x, int baseline, int max_w, const char *s) {
+    if (!s || !s[0] || max_w <= 0) return;
+    if (text_w(a, f, s) <= max_w) {
+        draw_text(a, f, c, x, baseline, s);
+        return;
+    }
+    char buf[TEXT_SIZE + 4];
+    snprintf(buf, sizeof(buf), "%s", s);
+    int len = (int)strlen(buf);
+    while (len > 0) {
+        len--;
+        while (len > 0 && ((unsigned char)buf[len] & 0xc0) == 0x80) len--;
+        buf[len] = '\0';
+        strncat(buf, "…", sizeof(buf) - strlen(buf) - 1);
+        if (text_w(a, f, buf) <= max_w) { draw_text(a, f, c, x, baseline, buf); return; }
+        buf[len] = '\0';
     }
 }
 
-static void on_forward(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    if (app->history_index + 1 < app->history->len) {
-        app->history_index++;
-        go_to(app, g_ptr_array_index(app->history, app->history_index), FALSE);
+static Drawable draw_target(App *a) {
+    return a->backbuf ? a->backbuf : a->win;
+}
+
+static void fill_rect(App *a, XftColor *c, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    XSetForeground(a->dpy, a->gc, c->pixel);
+    XFillRectangle(a->dpy, draw_target(a), a->gc, x, y, (unsigned)w, (unsigned)h);
+}
+
+static void draw_rect(App *a, XftColor *c, int x, int y, int w, int h) {
+    if (w <= 1 || h <= 1) return;
+    XSetForeground(a->dpy, a->gc, c->pixel);
+    XDrawRectangle(a->dpy, draw_target(a), a->gc, x, y, (unsigned)(w-1), (unsigned)(h-1));
+}
+
+static void draw_line(App *a, XftColor *c, int x1, int y1, int x2, int y2) {
+    XSetForeground(a->dpy, a->gc, c->pixel);
+    XDrawLine(a->dpy, draw_target(a), a->gc, x1, y1, x2, y2);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Layout helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static int bar_y(void)   { return 0; }
+static int tool_y(void)  { return BAR_H; }
+static int list_y(void)  { return BAR_H + TOOL_H; }
+
+static int list_h(App *a) {
+    int h = a->win_h - list_y() - STATUS_H;
+    return h > 0 ? h : 1;
+}
+
+static int list_x(App *a) { return a->side_w + 2; }
+static int list_w(App *a) {
+    int w = a->win_w - a->side_w - 2 - SCROLL_W;
+    return w > 0 ? w : 1;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Button drawing
+ * ══════════════════════════════════════════════════════════════════*/
+#define UI_ICON_BACK       0
+#define UI_ICON_FORWARD    1
+#define UI_ICON_UP         2
+#define UI_ICON_GO         3
+#define UI_ICON_HIDDEN     4
+#define UI_ICON_NEW_FOLDER 5
+#define UI_ICON_NEW_FILE   6
+#define UI_ICON_BM_ADD     7
+#define UI_ICON_BM_REMOVE  8
+#define UI_ICON_VIEW_LIST  9
+#define UI_ICON_VIEW_ICONS 10
+#define UI_ICON_VIEW_LARGE 11
+#define UI_ICON_COUNT      12
+
+typedef struct { int x, y, w, h; const char *label; int id; int icon_id; } Btn;
+
+static void draw_btn(App *a, Btn *b, int hot) {
+    fill_rect(a, hot ? &a->btn_hot : &a->btn, b->x, b->y, b->w, b->h);
+    draw_rect(a, &a->edge, b->x, b->y, b->w, b->h);
+    if (b->icon_id >= 0 && b->icon_id < UI_ICON_COUNT && a->ui_icons[b->icon_id]) {
+        int iw = a->ui_icon_w[b->icon_id];
+        int ih = a->ui_icon_h[b->icon_id];
+        int ix = b->x + (b->w - iw) / 2;
+        int iy = b->y + (b->h - ih) / 2;
+        XPutImage(a->dpy, draw_target(a), a->gc, a->ui_icons[b->icon_id],
+                  0, 0, ix, iy, (unsigned)iw, (unsigned)ih);
+    } else if (b->label && b->label[0]) {
+        int bw = text_w(a, a->font, b->label);
+        int tx = b->x + (b->w - bw) / 2;
+        int ty = b->y + (b->h + a->font->ascent - a->font->descent) / 2;
+        draw_text_clip(a, a->font, &a->text, tx, ty, b->w - 4, b->label);
     }
 }
 
-static void on_up(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    GFile *parent = g_file_get_parent(app->location);
-    if (parent != NULL) {
-        go_to(app, parent, TRUE);
-        g_object_unref(parent);
+/* ════════════════════════════════════════════════════════════════════
+ * File size formatter
+ * ══════════════════════════════════════════════════════════════════*/
+static void fmt_size(guint64 bytes, char *out, size_t out_size) {
+    if (bytes >= 1024ULL * 1024ULL * 1024ULL)
+        snprintf(out, out_size, "%.1f GiB",
+                 (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    else if (bytes >= 1024ULL * 1024ULL)
+        snprintf(out, out_size, "%.1f MiB",
+                 (double)bytes / (1024.0 * 1024.0));
+    else if (bytes >= 1024ULL)
+        snprintf(out, out_size, "%.1f KiB", (double)bytes / 1024.0);
+    else
+        snprintf(out, out_size, "%llu B", (unsigned long long)bytes);
+}
+
+static void fmt_time(guint64 epoch, char *out, size_t out_size) {
+    time_t t = (time_t)epoch;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, out_size, "%Y-%m-%d %H:%M", &tm);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Config I/O
+ * ══════════════════════════════════════════════════════════════════*/
+static void load_config(App *a) {
+    FILE *f = fopen(a->config_path, "r");
+    if (!f) return;
+    char line[PATH_MAX * 2];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        /* trim key */
+        char *ke = key + strlen(key) - 1;
+        while (ke >= key && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+        /* trim val */
+        while (*val == ' ' || *val == '\t') val++;
+        char *ve = val + strlen(val) - 1;
+        while (ve >= val && (*ve == '\n' || *ve == '\r' ||
+                              *ve == ' ' || *ve == '\t')) *ve-- = '\0';
+
+        if (strcmp(key, "show_hidden") == 0)
+            a->show_hidden = strcmp(val, "true") == 0 || strcmp(val, "1") == 0;
+        else if (strcmp(key, "start_location") == 0) {
+            /* parse into address bar; go_to called after init */
+            snprintf(a->address, sizeof(a->address), "%s", val);
+            a->address_len = (int)strlen(a->address);
+        } else if (strcmp(key, "bookmark") == 0 &&
+                   a->bookmark_count < MAX_BOOKMARKS) {
+            GFile *gf = g_file_new_for_commandline_arg(val);
+            if (gf && g_file_query_exists(gf, NULL))
+                a->bookmarks[a->bookmark_count++] = gf;
+            else if (gf) g_object_unref(gf);
+        } else if (strcmp(key, "recent") == 0 &&
+                   a->recent_count < MAX_RECENT) {
+            GFile *gf = g_file_new_for_commandline_arg(val);
+            if (gf && g_file_query_exists(gf, NULL) && is_under_home(gf))
+                a->recent[a->recent_count++] = gf;
+            else if (gf) g_object_unref(gf);
+        }
+    }
+    fclose(f);
+}
+
+static void save_config(App *a) {
+    /* ensure directory */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", a->config_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = '\0'; g_mkdir_with_parents(dir, 0700); }
+
+    FILE *f = fopen(a->config_path, "w");
+    if (!f) return;
+    fprintf(f, "show_hidden=%s\n", a->show_hidden ? "true" : "false");
+    if (a->location) {
+        char *p = g_file_get_path(a->location);
+        if (!p) p = g_file_get_uri(a->location);
+        fprintf(f, "start_location=%s\n", p);
+        g_free(p);
+    } else {
+        fprintf(f, "start_location=~\n");
+    }
+    for (int i = 0; i < a->bookmark_count; i++) {
+        char *p = g_file_get_path(a->bookmarks[i]);
+        if (!p) p = g_file_get_uri(a->bookmarks[i]);
+        fprintf(f, "bookmark=%s\n", p);
+        g_free(p);
+    }
+    for (int i = 0; i < a->recent_count; i++) {
+        char *p = g_file_get_path(a->recent[i]);
+        if (!p) p = g_file_get_uri(a->recent[i]);
+        fprintf(f, "recent=%s\n", p);
+        g_free(p);
+    }
+    fclose(f);
+}
+
+
+/* ════════════════════════════════════════════════════════════════════
+ * Home / recent helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static char *get_effective_home_path(void) {
+    /* prefer passwd entry for real user, then env, then fallbacks */
+    const char *pw_dir = g_get_home_dir();
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && g_file_test(pw->pw_dir, G_FILE_TEST_IS_DIR))
+        return g_strdup(pw->pw_dir);
+    if (pw_dir && g_file_test(pw_dir, G_FILE_TEST_IS_DIR))
+        return g_strdup(pw_dir);
+    const char *envh = getenv("HOME");
+    if (envh && g_file_test(envh, G_FILE_TEST_IS_DIR))
+        return g_strdup(envh);
+    const char *user = g_get_user_name();
+    if (user && *user) {
+        char *p = g_build_filename("/home", user, NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_DIR)) return p;
+        g_free(p);
+    }
+    /* avoid returning "/" as "home" unless nothing else exists */
+    if (envh && *envh) return g_strdup(envh);
+    if (pw_dir && *pw_dir) return g_strdup(pw_dir);
+    return g_strdup("/");
+}
+
+static GFile *get_home_file(void) {
+    char *p = get_effective_home_path();
+    GFile *f = g_file_new_for_path(p);
+    g_free(p);
+    return f;
+}
+
+static gboolean is_under_home(GFile *file) {
+    if (!file) return FALSE;
+    char *homep = get_effective_home_path();
+    GFile *home = g_file_new_for_path(homep);
+    gboolean ok = g_file_equal(file, home) || g_file_has_prefix(file, home);
+    g_object_unref(home);
+    g_free(homep);
+    return ok;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Address bar
+ * ══════════════════════════════════════════════════════════════════*/
+static void address_set(App *a, GFile *file) {
+    char *p = g_file_get_path(file);
+    if (!p) p = g_file_get_uri(file);
+    snprintf(a->address, sizeof(a->address), "%s", p);
+    a->address_len = (int)strlen(a->address);
+    a->address_cursor = a->address_len;
+    g_free(p);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Recent locations
+ * ══════════════════════════════════════════════════════════════════*/
+static void remember_location(App *a, GFile *file) {
+    if (!is_under_home(file)) return;
+    for (int i = 0; i < a->recent_count; i++) {
+        if (g_file_equal(a->recent[i], file)) {
+            g_object_unref(a->recent[i]);
+            memmove(&a->recent[i], &a->recent[i+1],
+                    (a->recent_count - i - 1) * sizeof(GFile*));
+            a->recent_count--;
+            break;
+        }
+    }
+    if (a->recent_count < MAX_RECENT) {
+        memmove(&a->recent[1], &a->recent[0],
+                a->recent_count * sizeof(GFile*));
+        a->recent[0] = g_object_ref(file);
+        a->recent_count++;
+    } else {
+        g_object_unref(a->recent[a->recent_count - 1]);
+        memmove(&a->recent[1], &a->recent[0],
+                (a->recent_count - 1) * sizeof(GFile*));
+        a->recent[0] = g_object_ref(file);
+    }
+    save_config(a);
+    refresh_sidebar(a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * File listing
+ * ══════════════════════════════════════════════════════════════════*/
+static SortMode g_sort_mode = SORT_NAME;
+static int g_sort_desc = 0;
+
+static const char *file_ext_of(const char *name) {
+    if (!name) return "";
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) return "";
+    return dot + 1;
+}
+
+static int entry_cmp(const void *a_, const void *b_) {
+    const Entry *a = a_, *b = b_;
+    if (a->ftype == FT_DIR && b->ftype != FT_DIR) return -1;
+    if (a->ftype != FT_DIR && b->ftype == FT_DIR) return  1;
+
+    int r = 0;
+    switch (g_sort_mode) {
+    case SORT_TYPE: {
+        const char *ea = file_ext_of(a->name);
+        const char *eb = file_ext_of(b->name);
+        r = strcasecmp(ea, eb);
+        if (r == 0) r = strcasecmp(a->type_str, b->type_str);
+        if (r == 0) r = strcasecmp(a->name, b->name);
+        break;
+    }
+    case SORT_SIZE:
+        if (a->size_bytes < b->size_bytes) r = -1;
+        else if (a->size_bytes > b->size_bytes) r = 1;
+        else r = strcasecmp(a->name, b->name);
+        break;
+    case SORT_DATE:
+        if (a->mtime < b->mtime) r = -1;
+        else if (a->mtime > b->mtime) r = 1;
+        else r = strcasecmp(a->name, b->name);
+        break;
+    case SORT_NAME:
+    default:
+        r = strcasecmp(a->name, b->name);
+        break;
+    }
+    return g_sort_desc ? -r : r;
+}
+
+static void free_entry_thumb(Entry *e) {
+    if (e->thumb) {
+        /* XDestroyImage frees the data buffer we provided */
+        XDestroyImage(e->thumb);
+        e->thumb = NULL;
+    }
+    if (e->thumb_pixbuf) {
+        g_object_unref(e->thumb_pixbuf);
+        e->thumb_pixbuf = NULL;
+    }
+    e->thumb_w = e->thumb_h = 0;
+    e->thumb_req_size = 0;
+    e->thumb_failed = 0;
+}
+
+static void refresh_listing(App *a) {
+    /* preserve thumbnails/selection by name where possible */
+    Entry old[MAX_ENTRIES];
+    int old_count = a->entry_count;
+    if (old_count > MAX_ENTRIES) old_count = MAX_ENTRIES;
+    memcpy(old, a->entries, (size_t)old_count * sizeof(Entry));
+
+    a->entry_count = 0;
+    a->list_sel = -1;
+    a->list_scroll = 0;
+    a->sel_anchor = -1;
+
+    if (!a->location) {
+        for (int i = 0; i < old_count; i++) {
+            free_entry_thumb(&old[i]);
+            if (old[i].file) g_object_unref(old[i].file);
+        }
+        return;
+    }
+
+    GError *err = NULL;
+    GFileEnumerator *en = g_file_enumerate_children(
+        a->location,
+        G_FILE_ATTRIBUTE_STANDARD_NAME ","
+        G_FILE_ATTRIBUTE_STANDARD_TYPE ","
+        G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+        G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN ","
+        G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE ","
+        G_FILE_ATTRIBUTE_TIME_MODIFIED,
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &err);
+    if (!en) {
+        for (int i = 0; i < old_count; i++) {
+            free_entry_thumb(&old[i]);
+            if (old[i].file) g_object_unref(old[i].file);
+        }
+        show_error(a, "Cannot open directory",
+                   err ? err->message : "Unknown error");
+        if (err) g_error_free(err);
+        return;
+    }
+
+    char search_lower[TEXT_SIZE] = {0};
+    for (int i = 0; a->search[i] && i < TEXT_SIZE - 1; i++)
+        search_lower[i] = (char)tolower((unsigned char)a->search[i]);
+
+    GFileInfo *info;
+    while ((info = g_file_enumerator_next_file(en, NULL, NULL)) != NULL) {
+        const char *name = g_file_info_get_name(info);
+        gboolean hidden = g_file_info_get_is_hidden(info) ||
+                          (name && name[0] == '.');
+        if (hidden && !a->show_hidden) { g_object_unref(info); continue; }
+
+        if (search_lower[0]) {
+            char nl[NAME_SIZE];
+            int j; for (j = 0; name[j] && j < NAME_SIZE - 1; j++)
+                nl[j] = (char)tolower((unsigned char)name[j]);
+            nl[j] = '\0';
+            if (!strstr(nl, search_lower)) { g_object_unref(info); continue; }
+        }
+
+        if (a->entry_count >= MAX_ENTRIES) { g_object_unref(info); continue; }
+
+        Entry *e = &a->entries[a->entry_count++];
+        memset(e, 0, sizeof(*e));
+        snprintf(e->name, sizeof(e->name), "%s", name);
+
+        GFileType ft = g_file_info_get_file_type(info);
+        switch (ft) {
+            case G_FILE_TYPE_DIRECTORY:    e->ftype = FT_DIR;   snprintf(e->type_str, sizeof(e->type_str), "Folder"); break;
+            case G_FILE_TYPE_SYMBOLIC_LINK:e->ftype = FT_LINK;  snprintf(e->type_str, sizeof(e->type_str), "Link");   break;
+            case G_FILE_TYPE_REGULAR:      e->ftype = FT_REG;   snprintf(e->type_str, sizeof(e->type_str), "File");   break;
+            default:                       e->ftype = FT_OTHER; snprintf(e->type_str, sizeof(e->type_str), "Other");  break;
+        }
+
+        const char *ctype = g_file_info_get_content_type(info);
+        snprintf(e->content_type, sizeof(e->content_type), "%s", ctype ? ctype : "");
+
+        e->size_bytes = (gint64)g_file_info_get_size(info);
+        if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_TIME_MODIFIED)) {
+            e->mtime = (guint64)g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
+        } else {
+            e->mtime = 0;
+        }
+        if (ft == G_FILE_TYPE_DIRECTORY) {
+            snprintf(e->size, sizeof(e->size), "—");
+        } else {
+            fmt_size((guint64)e->size_bytes, e->size, sizeof(e->size));
+        }
+
+        e->file = g_file_get_child(a->location, name);
+        e->selected = 0;
+        e->thumb = NULL;
+        e->thumb_w = e->thumb_h = 0;
+        e->thumb_req_size = 0;
+        e->thumb_pixbuf = NULL;
+        e->thumb_failed = 0;
+
+        /* reuse thumb cache from old entry with same name and type */
+        for (int oi = 0; oi < old_count; oi++) {
+            if (strcmp(old[oi].name, e->name) == 0 && old[oi].ftype == e->ftype) {
+                e->thumb = old[oi].thumb; old[oi].thumb = NULL;
+                e->thumb_w = old[oi].thumb_w;
+                e->thumb_h = old[oi].thumb_h;
+                e->thumb_req_size = old[oi].thumb_req_size;
+                e->thumb_pixbuf = old[oi].thumb_pixbuf; old[oi].thumb_pixbuf = NULL;
+                e->thumb_failed = old[oi].thumb_failed;
+                e->selected = old[oi].selected;
+                break;
+            }
+        }
+        g_object_unref(info);
+    }
+    g_object_unref(en);
+
+    /* free remaining old entries */
+    for (int i = 0; i < old_count; i++) {
+        free_entry_thumb(&old[i]);
+        if (old[i].file) g_object_unref(old[i].file);
+    }
+
+    g_sort_mode = a->sort_mode;
+    g_sort_desc = a->sort_desc;
+    qsort(a->entries, (size_t)a->entry_count, sizeof(Entry), entry_cmp);
+    draw_app(a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Sidebar
+ * ══════════════════════════════════════════════════════════════════*/
+static void side_add(App *a, const char *name, SideKind kind,
+                     GFile *file, GVolume *vol, GMount *mnt, int indent,
+                     int expandable, int expanded) {
+    if (a->side_count >= MAX_SIDE) return;
+    SideEntry *s = &a->side[a->side_count++];
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    s->kind   = kind;
+    s->file   = file   ? g_object_ref(file)   : NULL;
+    s->volume = vol    ? g_object_ref(vol)    : NULL;
+    s->mount  = mnt    ? g_object_ref(mnt)    : NULL;
+    s->indent = indent;
+    s->expandable = expandable;
+    s->expanded = expanded;
+}
+
+static void side_free_all(App *a) {
+    for (int i = 0; i < a->side_count; i++) {
+        if (a->side[i].file)   { g_object_unref(a->side[i].file);   a->side[i].file   = NULL; }
+        if (a->side[i].volume) { g_object_unref(a->side[i].volume); a->side[i].volume = NULL; }
+        if (a->side[i].mount)  { g_object_unref(a->side[i].mount);  a->side[i].mount  = NULL; }
+    }
+    a->side_count = 0;
+}
+
+static void refresh_sidebar(App *a) {
+    side_free_all(a);
+
+    side_add(a, "Places", ST_PLACES_GROUP, NULL, NULL, NULL, 0, 1, a->places_expanded);
+    if (a->places_expanded) {
+        GFile *home = get_home_file();
+        GFile *root = g_file_new_for_path("/");
+        side_add(a, "Home",        ST_HOME, home, NULL, NULL, 1, 0, 0);
+        side_add(a, "File System", ST_ROOT, root, NULL, NULL, 1, 0, 0);
+        g_object_unref(home);
+        g_object_unref(root);
+    }
+
+    side_add(a, "Bookmarks", ST_BM_GROUP, NULL, NULL, NULL, 0, 1, a->bm_expanded);
+    if (a->bm_expanded) {
+        for (int i = 0; i < a->bookmark_count; i++) {
+            char *bn = g_file_get_basename(a->bookmarks[i]);
+            if (!bn || !bn[0]) { g_free(bn); bn = gfm_get_path_or_uri(a->bookmarks[i]); }
+            side_add(a, bn, ST_BM, a->bookmarks[i], NULL, NULL, 1, 0, 0);
+            g_free(bn);
+        }
+    }
+
+    side_add(a, "Recent", ST_RECENT_GROUP, NULL, NULL, NULL, 0, 1, a->recent_expanded);
+    if (a->recent_expanded) {
+        for (int i = 0; i < a->recent_count; i++) {
+            if (!is_under_home(a->recent[i])) continue;
+            char *bn = g_file_get_basename(a->recent[i]);
+            if (!bn || !bn[0]) { g_free(bn); bn = gfm_get_path_or_uri(a->recent[i]); }
+            side_add(a, bn, ST_RECENT, a->recent[i], NULL, NULL, 1, 0, 0);
+            g_free(bn);
+        }
+    }
+
+    side_add(a, "Devices", ST_DEV_GROUP, NULL, NULL, NULL, 0, 1, a->dev_expanded);
+    if (a->dev_expanded && a->volume_monitor) {
+        GList *vols = g_volume_monitor_get_volumes(a->volume_monitor);
+        for (GList *item = vols; item; item = item->next) {
+            GVolume *vol = item->data;
+            GMount  *mnt = g_volume_get_mount(vol);
+            if (mnt || g_volume_can_mount(vol)) {
+                char *vname = g_volume_get_name(vol);
+                GFile *mroot = mnt ? g_mount_get_root(mnt) : NULL;
+                side_add(a, vname ? vname : "Volume", ST_VOL,
+                         mroot, vol, mnt, 1, 0, 0);
+                g_free(vname);
+                if (mroot) g_object_unref(mroot);
+            }
+            if (mnt) g_object_unref(mnt);
+        }
+        g_list_free_full(vols, g_object_unref);
+
+        GList *mnts = g_volume_monitor_get_mounts(a->volume_monitor);
+        for (GList *item = mnts; item; item = item->next) {
+            GMount  *mnt = item->data;
+            GVolume *vol = g_mount_get_volume(mnt);
+            if (!vol && (g_mount_can_unmount(mnt) || g_mount_can_eject(mnt))) {
+                char *mname = g_mount_get_name(mnt);
+                char label[NAME_SIZE];
+                snprintf(label, sizeof(label), "Mounted: %s", mname ? mname : "?");
+                GFile *mroot = g_mount_get_root(mnt);
+                side_add(a, label, ST_VOL, mroot, NULL, mnt, 1, 0, 0);
+                g_free(mname);
+                if (mroot) g_object_unref(mroot);
+            }
+            if (vol) g_object_unref(vol);
+        }
+        g_list_free_full(mnts, g_object_unref);
     }
 }
 
-static void on_address_activate(GtkEntry *entry, gpointer data) {
-    App *app = data;
-    const gchar *text = gtk_entry_get_text(entry);
-    GFile *file = file_from_address(text, app->location);
-    go_to(app, file, TRUE);
-    g_object_unref(file);
+static void update_free_space(App *a) {
+    if (!a->location) { snprintf(a->free_space, sizeof(a->free_space), "Bos alan: -"); return; }
+    GError *err = NULL;
+    GFileInfo *info = g_file_query_filesystem_info(a->location,
+        G_FILE_ATTRIBUTE_FILESYSTEM_FREE "," G_FILE_ATTRIBUTE_FILESYSTEM_SIZE,
+        NULL, &err);
+    if (!info) {
+        if (err) g_error_free(err);
+        snprintf(a->free_space, sizeof(a->free_space), "Bos alan: -");
+        return;
+    }
+    guint64 freeb = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+    char fbuf[64];
+    fmt_size(freeb, fbuf, sizeof(fbuf));
+    snprintf(a->free_space, sizeof(a->free_space), "Bos alan: %.100s", fbuf);
+    g_object_unref(info);
 }
 
-static void on_go_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    on_address_activate(GTK_ENTRY(app->address), app);
+
+/* ════════════════════════════════════════════════════════════════════
+ * Navigation
+ * ══════════════════════════════════════════════════════════════════*/
+static void go_to(App *a, GFile *file, int add_history) {
+    GError *err = NULL;
+    GFileInfo *info = g_file_query_info(file,
+        G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NONE, NULL, &err);
+    if (!info || g_file_info_get_file_type(info) != G_FILE_TYPE_DIRECTORY) {
+        if (err) g_error_free(err);
+        if (info) g_object_unref(info);
+
+        /* fallback to effective home if requested location is unavailable */
+        GFile *home = get_home_file();
+        if (file && !g_file_equal(file, home)) {
+            go_to(a, home, add_history);
+            g_object_unref(home);
+            return;
+        }
+        g_object_unref(home);
+        show_error(a, "Cannot open location", "Start location is not available");
+        return;
+    }
+    g_object_unref(info);
+
+    if (a->location) g_object_unref(a->location);
+    a->location = g_object_ref(file);
+
+    if (add_history) {
+        /* truncate forward */
+        for (int i = a->history_index + 1; i < a->history_count; i++)
+            g_object_unref(a->history[i]);
+        a->history_count = a->history_index + 1;
+        if (a->history_count < MAX_HISTORY) {
+            a->history[a->history_count++] = g_object_ref(file);
+            a->history_index = a->history_count - 1;
+        }
+    }
+
+    address_set(a, file);
+    update_free_space(a);
+    update_dir_monitor(a);
+    refresh_listing(a);
+    remember_location(a, file);
 }
 
-static void on_search_changed(GtkEditable *editable, gpointer data) {
-    (void)editable;
-    refresh_listing(data);
+static void nav_back(App *a) {
+    if (a->history_index > 0) {
+        a->history_index--;
+        go_to(a, a->history[a->history_index], 0);
+    }
 }
 
-static void on_hidden_toggled(GtkToggleButton *button, gpointer data) {
-    App *app = data;
-    app->show_hidden = gtk_toggle_button_get_active(button);
-    save_config(app);
-    refresh_listing(app);
+static void nav_forward(App *a) {
+    if (a->history_index + 1 < a->history_count) {
+        a->history_index++;
+        go_to(a, a->history[a->history_index], 0);
+    }
 }
 
-static void bookmark_current_location(App *app) {
-    add_unique_file(app->bookmarks, app->location, 50);
-    save_config(app);
-    refresh_sidebar(app);
+static void nav_up(App *a) {
+    if (!a->location) return;
+    GFile *parent = g_file_get_parent(a->location);
+    if (parent) { go_to(a, parent, 1); g_object_unref(parent); }
 }
 
-static void forget_current_bookmark(App *app) {
-    for (guint i = 0; i < app->bookmarks->len; i++) {
-        if (g_file_equal(g_ptr_array_index(app->bookmarks, i),
-                         app->location)) {
-            g_ptr_array_remove_index(app->bookmarks, i);
-            save_config(app);
-            refresh_sidebar(app);
+/* ════════════════════════════════════════════════════════════════════
+ * Realtime directory monitoring
+ * ══════════════════════════════════════════════════════════════════*/
+static gboolean refresh_idle_cb(gpointer ud) {
+    App *a = ud;
+    a->refresh_idle_id = 0;
+    refresh_listing(a);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_refresh(App *a) {
+    if (a->refresh_idle_id) return;
+    a->refresh_idle_id = g_timeout_add(200, refresh_idle_cb, a);
+}
+
+static void on_dir_changed(GFileMonitor *monitor, GFile *file, GFile *other,
+                           GFileMonitorEvent event_type, gpointer ud) {
+    (void)monitor; (void)file; (void)other; (void)event_type;
+    schedule_refresh((App *)ud);
+}
+
+static void update_dir_monitor(App *a) {
+    if (a->refresh_idle_id) {
+        g_source_remove(a->refresh_idle_id);
+        a->refresh_idle_id = 0;
+    }
+    if (a->dir_monitor) {
+        if (a->dir_monitor_id)
+            g_signal_handler_disconnect(a->dir_monitor, a->dir_monitor_id);
+        g_file_monitor_cancel(a->dir_monitor);
+        g_object_unref(a->dir_monitor);
+        a->dir_monitor = NULL;
+        a->dir_monitor_id = 0;
+    }
+    if (!a->location) return;
+    GError *err = NULL;
+    a->dir_monitor = g_file_monitor_directory(a->location,
+                                              G_FILE_MONITOR_WATCH_MOVES,
+                                              NULL, &err);
+    if (!a->dir_monitor) {
+        if (err) g_error_free(err);
+        return;
+    }
+    a->dir_monitor_id = g_signal_connect(a->dir_monitor, "changed",
+                                         G_CALLBACK(on_dir_changed), a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Open entry
+ * ══════════════════════════════════════════════════════════════════*/
+static void open_entry(App *a, int index) {
+    if (index < 0 || index >= a->entry_count) return;
+    Entry *e = &a->entries[index];
+    if (e->ftype == FT_DIR) {
+        go_to(a, e->file, 1);
+    } else {
+        char *uri = g_file_get_uri(e->file);
+        GError *err = NULL;
+        g_app_info_launch_default_for_uri(uri, NULL, &err);
+        if (err) { show_error(a, "Cannot open file", err->message); g_error_free(err); }
+        g_free(uri);
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Volume mount callback
+ * ══════════════════════════════════════════════════════════════════*/
+static void on_volume_mounted(GObject *src, GAsyncResult *res, gpointer ud) {
+    App *a = ud;
+    GError *err = NULL;
+    if (!g_volume_mount_finish(G_VOLUME(src), res, &err)) {
+        show_error(a, "Could not mount device", err ? err->message : "");
+        if (err) g_error_free(err);
+        return;
+    }
+    GMount *mnt = g_volume_get_mount(G_VOLUME(src));
+    if (mnt) {
+        GFile *root = g_mount_get_root(mnt);
+        go_to(a, root, 1);
+        g_object_unref(root);
+        g_object_unref(mnt);
+    }
+    refresh_sidebar(a);
+    draw_app(a);
+}
+
+static void on_mount_unmounted(GObject *src, GAsyncResult *res, gpointer ud) {
+    App *a = ud;
+    GError *err = NULL;
+    if (!g_mount_unmount_with_operation_finish(G_MOUNT(src), res, &err)) {
+        show_error(a, "Could not unmount", err ? err->message : "");
+        if (err) g_error_free(err);
+    }
+    refresh_sidebar(a);
+    draw_app(a);
+}
+
+static void on_volume_changed(GVolumeMonitor *m, GObject *o, gpointer ud) {
+    (void)m; (void)o;
+    App *a = ud;
+    refresh_sidebar(a);
+    draw_app(a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Copy queue (background thread)
+ * ══════════════════════════════════════════════════════════════════*/
+static void copy_progress_cb(goffset cur, goffset total, gpointer ud) {
+    App *a = ud;
+    pthread_mutex_lock(&a->copy_mutex);
+    a->copy_fraction = total > 0 ? (double)cur / (double)total : 0.0;
+    pthread_mutex_unlock(&a->copy_mutex);
+}
+
+static void *copy_worker(void *ud) {
+    App *a = ud;
+    for (;;) {
+        pthread_mutex_lock(&a->copy_mutex);
+        while (a->copy_q_len == 0 && !a->shutting_down)
+            pthread_cond_wait(&a->copy_cond, &a->copy_mutex);
+        if (a->shutting_down) { pthread_mutex_unlock(&a->copy_mutex); break; }
+
+        CopyJob job = a->copy_queue[a->copy_q_head];
+        a->copy_q_head = (a->copy_q_head + 1) % MAX_COPY_Q;
+        a->copy_q_len--;
+        char *p = g_file_get_path(job.source);
+        if (!p) p = g_file_get_uri(job.source);
+        snprintf(a->copy_current, sizeof(a->copy_current), "%s", p);
+        g_free(p);
+        a->copy_fraction = 0.0;
+        pthread_mutex_unlock(&a->copy_mutex);
+
+        GError *err = NULL;
+        if (job.is_move)
+            gfm_move_to_directory(job.source, job.destination_directory, &err);
+        else
+            gfm_copy_to_directory_full(job.source, job.destination_directory,
+                                       NULL, copy_progress_cb, a, &err);
+
+        pthread_mutex_lock(&a->copy_mutex);
+        if (err) {
+            snprintf(a->copy_error, sizeof(a->copy_error), "%s", err->message);
+            g_error_free(err);
+        }
+        if (a->copy_q_len == 0) {
+            a->copy_running = 0;
+            a->copy_fraction = 0.0;
+            a->copy_current[0] = '\0';
+        }
+        pthread_mutex_unlock(&a->copy_mutex);
+
+        g_object_unref(job.source);
+        g_object_unref(job.destination_directory);
+    }
+    return NULL;
+}
+
+static void queue_copy(App *a, GFile *src, GFile *dst, int is_move) {
+    pthread_mutex_lock(&a->copy_mutex);
+    if (a->copy_q_len < MAX_COPY_Q) {
+        CopyJob *j = &a->copy_queue[a->copy_q_tail];
+        j->source = g_object_ref(src);
+        j->destination_directory = g_object_ref(dst);
+        j->is_move = is_move;
+        a->copy_q_tail = (a->copy_q_tail + 1) % MAX_COPY_Q;
+        a->copy_q_len++;
+        a->copy_running = 1;
+        pthread_cond_signal(&a->copy_cond);
+    }
+    pthread_mutex_unlock(&a->copy_mutex);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Clipboard (X11 selection protocol)
+ * ══════════════════════════════════════════════════════════════════*/
+static void clipboard_set_selected(App *a, int is_cut) {
+    free(a->clipboard_data);
+    a->clipboard_data = NULL;
+    a->clipboard_is_cut = is_cut;
+
+    /* collect selected or focused */
+    int count = selected_count(a);
+    GString *gs = g_string_new(is_cut ? "cut\n" : "copy\n");
+    if (count > 0) {
+        for (int i = 0; i < a->entry_count; i++) {
+            if (!a->entries[i].selected) continue;
+            char *uri = g_file_get_uri(a->entries[i].file);
+            g_string_append(gs, uri);
+            g_string_append_c(gs, '\n');
+            g_free(uri);
+        }
+    } else if (a->list_sel >= 0 && a->list_sel < a->entry_count) {
+        char *uri = g_file_get_uri(a->entries[a->list_sel].file);
+        g_string_append(gs, uri);
+        g_string_append_c(gs, '\n');
+        g_free(uri);
+    } else {
+        g_string_free(gs, TRUE);
+        return;
+    }
+
+    a->clipboard_data = g_string_free(gs, FALSE);
+    XSetSelectionOwner(a->dpy, a->atom_clipboard, a->win, CurrentTime);
+    XFlush(a->dpy);
+}
+
+static void handle_selection_request(App *a, XSelectionRequestEvent *req) {
+    XSelectionEvent ev = {0};
+    ev.type      = SelectionNotify;
+    ev.requestor = req->requestor;
+    ev.selection = req->selection;
+    ev.target    = req->target;
+    ev.time      = req->time;
+    ev.property  = None;
+
+    if (!a->clipboard_data) {
+        XSendEvent(a->dpy, req->requestor, False, 0, (XEvent *)&ev);
+        return;
+    }
+
+    if (req->target == a->atom_targets) {
+        Atom targets[4] = { a->atom_gnome_files, a->atom_uri_list,
+                             a->atom_utf8, XA_STRING };
+        XChangeProperty(a->dpy, req->requestor, req->property,
+                        XA_ATOM, 32, PropModeReplace,
+                        (unsigned char *)targets, 4);
+        ev.property = req->property;
+    } else if (req->target == a->atom_gnome_files ||
+               req->target == a->atom_uri_list    ||
+               req->target == a->atom_utf8 ||
+               req->target == XA_STRING) {
+        XChangeProperty(a->dpy, req->requestor, req->property,
+                        req->target == XA_STRING ? XA_STRING : req->target,
+                        8, PropModeReplace,
+                        (unsigned char *)a->clipboard_data,
+                        (int)strlen(a->clipboard_data));
+        ev.property = req->property;
+    }
+    XSendEvent(a->dpy, req->requestor, False, 0, (XEvent *)&ev);
+}
+
+static void clipboard_paste(App *a) {
+    if (XGetSelectionOwner(a->dpy, a->atom_clipboard) == None) return;
+
+    /* Request GNOME format first */
+    XConvertSelection(a->dpy, a->atom_clipboard, a->atom_gnome_files,
+                      a->atom_gnome_files, a->win, CurrentTime);
+    XFlush(a->dpy);
+    /* Result handled in SelectionNotify event */
+}
+
+static void handle_selection_notify(App *a, XSelectionEvent *ev) {
+    if (ev->property == None) return;
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *data = NULL;
+
+    XGetWindowProperty(a->dpy, a->win, ev->property, 0, 65536, True,
+                       AnyPropertyType, &actual_type, &actual_format,
+                       &nitems, &bytes_after, &data);
+    if (!data) return;
+
+    char *text = (char *)data;
+    gboolean is_move = FALSE;
+    GPtrArray *files = gfm_parse_uri_list(text, &is_move);
+    XFree(data);
+
+    if (!files) return;
+    for (guint i = 0; i < files->len; i++) {
+        GFile *src = g_ptr_array_index(files, i);
+        queue_copy(a, src, a->location, (int)is_move);
+    }
+    g_ptr_array_unref(files);
+    refresh_listing(a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Dialogs
+ * ══════════════════════════════════════════════════════════════════*/
+static void show_error(App *a, const char *summary, const char *detail) {
+    snprintf(a->err_text,   sizeof(a->err_text),   "%s", summary ? summary : "Error");
+    snprintf(a->err_detail, sizeof(a->err_detail), "%s", detail  ? detail  : "");
+    a->err_open    = 1;
+    a->dialog_open = 0;
+    a->props_open  = 0;
+    draw_app(a);
+}
+
+static void start_dialog(App *a, const char *title, const char *prompt,
+                         void (*ok_cb)(void *)) {
+    snprintf(a->dialog_title,  sizeof(a->dialog_title),  "%s", title);
+    snprintf(a->dialog_prompt, sizeof(a->dialog_prompt), "%s", prompt);
+    a->dialog_value[0] = '\0';
+    a->dialog_len = 0;
+    a->dialog_ok  = ok_cb;
+    a->dialog_open = 1;
+    a->err_open    = 0;
+    a->props_open  = 0;
+    draw_app(a);
+}
+
+static void close_picker(App *a);
+
+static void picker_clear(App *a) {
+    for (int i = 0; i < a->picker_count; i++) {
+        if (a->picker_files[i]) { g_object_unref(a->picker_files[i]); a->picker_files[i] = NULL; }
+    }
+    a->picker_count = 0;
+    a->picker_sel = -1;
+    a->picker_scroll = 0;
+}
+
+static void close_picker(App *a) {
+    picker_clear(a);
+    if (a->picker_dir) { g_object_unref(a->picker_dir); a->picker_dir = NULL; }
+    a->picker_open = 0;
+    a->picker_move = 0;
+}
+
+static void picker_refresh(App *a, GFile *dir) {
+    picker_clear(a);
+    if (a->picker_dir) g_object_unref(a->picker_dir);
+    a->picker_dir = g_object_ref(dir);
+
+    GError *err = NULL;
+    GFileEnumerator *en = g_file_enumerate_children(
+        dir, G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE "," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
+        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &err);
+    if (!en) { if (err) g_error_free(err); return; }
+
+    GFileInfo *info;
+    while ((info = g_file_enumerator_next_file(en, NULL, NULL)) != NULL) {
+        const char *name = g_file_info_get_name(info);
+        gboolean hidden = g_file_info_get_is_hidden(info) || (name && name[0] == '.');
+        GFileType ft = g_file_info_get_file_type(info);
+        if (hidden || ft != G_FILE_TYPE_DIRECTORY) { g_object_unref(info); continue; }
+        if (a->picker_count >= 256) { g_object_unref(info); continue; }
+        snprintf(a->picker_names[a->picker_count], NAME_SIZE, "%s", name);
+        a->picker_files[a->picker_count] = g_file_get_child(dir, name);
+        a->picker_count++;
+        g_object_unref(info);
+    }
+    g_object_unref(en);
+
+    /* sort by name */
+    for (int i = 0; i < a->picker_count; i++) {
+        for (int j = i + 1; j < a->picker_count; j++) {
+            if (strcasecmp(a->picker_names[i], a->picker_names[j]) > 0) {
+                char tmpn[NAME_SIZE]; snprintf(tmpn, sizeof(tmpn), "%s", a->picker_names[i]);
+                snprintf(a->picker_names[i], NAME_SIZE, "%s", a->picker_names[j]);
+                snprintf(a->picker_names[j], NAME_SIZE, "%s", tmpn);
+                GFile *tmpf = a->picker_files[i]; a->picker_files[i] = a->picker_files[j]; a->picker_files[j] = tmpf;
+            }
+        }
+    }
+}
+
+static void picker_select_current(App *a) {
+    if (!a->picker_dir) return;
+    GFile *dst = a->picker_dir;
+    int count = selected_count(a);
+    if (count > 0) {
+        for (int i = 0; i < a->entry_count; i++)
+            if (a->entries[i].selected)
+                queue_copy(a, a->entries[i].file, dst, a->picker_move);
+    } else if (a->list_sel >= 0 && a->list_sel < a->entry_count) {
+        queue_copy(a, a->entries[a->list_sel].file, dst, a->picker_move);
+    }
+    close_picker(a);
+}
+
+static void open_picker(App *a, int is_move) {
+    close_picker(a);
+    a->picker_open = 1;
+    a->picker_move = is_move;
+    a->dialog_open = 0;
+    a->menu_open = 0;
+    GFile *start = a->location ? g_object_ref(a->location) : get_home_file();
+    picker_refresh(a, start);
+    g_object_unref(start);
+    draw_app(a);
+}
+
+static void show_props(App *a, int index) {
+    if (index < 0 || index >= a->entry_count) return;
+    Entry *e = &a->entries[index];
+    snprintf(a->props_path, sizeof(a->props_path), "%s", e->name);
+    snprintf(a->props_type, sizeof(a->props_type), "%s", e->type_str);
+    snprintf(a->props_size, sizeof(a->props_size), "%s", e->size);
+
+    GError *err = NULL;
+    GFileInfo *info = g_file_query_info(e->file,
+        G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_UNIX_MODE,
+        G_FILE_QUERY_INFO_NONE, NULL, &err);
+    if (info) {
+        guint64 mt = g_file_info_get_attribute_uint64(
+            info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
+        fmt_time(mt, a->props_mtime, sizeof(a->props_mtime));
+        a->props_has_mode = g_file_info_has_attribute(
+            info, G_FILE_ATTRIBUTE_UNIX_MODE);
+        if (a->props_has_mode)
+            a->props_mode = g_file_info_get_attribute_uint32(
+                info, G_FILE_ATTRIBUTE_UNIX_MODE);
+        g_object_unref(info);
+    } else {
+        snprintf(a->props_mtime, sizeof(a->props_mtime), "—");
+        a->props_has_mode = 0;
+        if (err) g_error_free(err);
+    }
+    if (a->props_file) g_object_unref(a->props_file);
+    a->props_file = g_object_ref(e->file);
+    a->props_open  = 1;
+    a->dialog_open = 0;
+    a->err_open    = 0;
+    draw_app(a);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Context menu items
+ * ══════════════════════════════════════════════════════════════════*/
+typedef struct { const char *icon; const char *label; int id; } MenuItem;
+
+#define MENU_NONE         0
+#define MENU_OPEN         1
+#define MENU_OPEN_WINE    2
+#define MENU_EXTRACT_HERE 3
+#define MENU_COPY_PATH    4
+#define MENU_COPY         5
+#define MENU_CUT          6
+#define MENU_PASTE        7
+#define MENU_COPYTO       8
+#define MENU_MOVETO       9
+#define MENU_RENAME      10
+#define MENU_TRASH       11
+#define MENU_DELETE      12
+#define MENU_PROPS       13
+#define MENU_NEWFOLDER   14
+#define MENU_NEWFILE     15
+#define MENU_REFRESH     16
+#define MENU_VIEW_LIST   17
+#define MENU_VIEW_ICONS  18
+#define MENU_SORT_NAME   19
+#define MENU_SORT_TYPE   20
+#define MENU_SORT_SIZE   21
+#define MENU_SORT_DATE   22
+#define MENU_SORT_ASC    23
+#define MENU_SORT_DESC   24
+
+static MenuItem g_menu_items[40];
+static int g_menu_count = 0;
+
+static int file_is_archive(const Entry *e) {
+    if (!e) return 0;
+    const char *n = e->name;
+    size_t l = strlen(n);
+    const char *exts[] = {".zip",".tar",".tar.gz",".tgz",".tar.bz2",".tbz2",".tar.xz",".txz",".tar.zst",".7z",".rar",".gz",".bz2",".xz",NULL};
+    for (int i = 0; exts[i]; i++) {
+        size_t el = strlen(exts[i]);
+        if (l >= el && strcasecmp(n + l - el, exts[i]) == 0) return 1;
+    }
+    if (strcasestr(e->content_type, "zip") || strcasestr(e->content_type, "tar") ||
+        strcasestr(e->content_type, "rar") || strcasestr(e->content_type, "7z") ||
+        strcasestr(e->content_type, "compressed")) return 1;
+    return 0;
+}
+
+static int file_is_windows_exec(const Entry *e) {
+    if (!e) return 0;
+    const char *n = e->name; size_t l = strlen(n);
+    return (l>=4 && strcasecmp(n+l-4,".exe")==0) ||
+           (l>=4 && strcasecmp(n+l-4,".msi")==0) ||
+           (l>=4 && strcasecmp(n+l-4,".bat")==0);
+}
+
+static int has_cmd(const char *cmd) {
+    gchar *p = g_find_program_in_path(cmd);
+    if (p) { g_free(p); return 1; }
+    return 0;
+}
+
+static void menu_push(const char *icon, const char *label, int id) {
+    if (g_menu_count >= (int)(sizeof(g_menu_items)/sizeof(g_menu_items[0]))) return;
+    g_menu_items[g_menu_count].icon = icon;
+    g_menu_items[g_menu_count].label = label;
+    g_menu_items[g_menu_count].id = id;
+    g_menu_count++;
+}
+
+static void build_context_menu(App *a) {
+    g_menu_count = 0;
+    Entry *sel = (a->list_sel >= 0 && a->list_sel < a->entry_count) ? &a->entries[a->list_sel] : NULL;
+    if (a->menu_on_file && sel) {
+        menu_push("↗", "Open", MENU_OPEN);
+        if (file_is_windows_exec(sel) && has_cmd("wine"))
+            menu_push("🍷", "Open with Wine", MENU_OPEN_WINE);
+        if (file_is_archive(sel))
+            menu_push("📦", "Extract Here", MENU_EXTRACT_HERE);
+        menu_push("", "", MENU_NONE);
+        menu_push("⧉", "Copy", MENU_COPY);
+        menu_push("✂", "Cut", MENU_CUT);
+        menu_push("📋", "Paste", MENU_PASTE);
+        menu_push("⌘", "Copy Path", MENU_COPY_PATH);
+        menu_push("⎘", "Copy to...", MENU_COPYTO);
+        menu_push("➜", "Move to...", MENU_MOVETO);
+        menu_push("", "", MENU_NONE);
+        menu_push("✎", "Rename", MENU_RENAME);
+        menu_push("🗑", "Move to Trash", MENU_TRASH);
+        menu_push("✖", "Delete Permanently", MENU_DELETE);
+        menu_push("", "", MENU_NONE);
+        menu_push("ℹ", "Properties", MENU_PROPS);
+    } else {
+        menu_push("+", "New Folder", MENU_NEWFOLDER);
+        menu_push("+", "New File", MENU_NEWFILE);
+        menu_push("📋", "Paste", MENU_PASTE);
+        menu_push("↻", "Refresh", MENU_REFRESH);
+        menu_push("", "", MENU_NONE);
+        menu_push("▦", a->icon_mode ? "List View" : "Icon View", a->icon_mode ? MENU_VIEW_LIST : MENU_VIEW_ICONS);
+        menu_push("", "", MENU_NONE);
+        menu_push(a->sort_mode == SORT_NAME ? "●" : "○", "Sort by Name", MENU_SORT_NAME);
+        menu_push(a->sort_mode == SORT_DATE ? "●" : "○", "Sort by Date", MENU_SORT_DATE);
+        menu_push(a->sort_mode == SORT_TYPE ? "●" : "○", "Sort by Type", MENU_SORT_TYPE);
+        menu_push(a->sort_mode == SORT_SIZE ? "●" : "○", "Sort by Size", MENU_SORT_SIZE);
+        menu_push("", "", MENU_NONE);
+        menu_push(!a->sort_desc ? "●" : "○", "Ascending", MENU_SORT_ASC);
+        menu_push(a->sort_desc ? "●" : "○", "Descending", MENU_SORT_DESC);
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Context callbacks
+ * ══════════════════════════════════════════════════════════════════*/
+static void rename_cancel(App *a) {
+    a->rename_active = 0;
+    a->rename_index = -1;
+    a->rename_text[0] = '\0';
+    a->rename_len = 0;
+    a->rename_cursor = 0;
+}
+
+static void rename_commit(App *a) {
+    if (!a->rename_active || a->rename_index < 0 || a->rename_index >= a->entry_count) {
+        rename_cancel(a);
+        return;
+    }
+    Entry *e = &a->entries[a->rename_index];
+    if (a->rename_len <= 0) { rename_cancel(a); draw_app(a); return; }
+    if (strcmp(e->name, a->rename_text) == 0) { rename_cancel(a); draw_app(a); return; }
+
+    char newname[NAME_SIZE];
+    snprintf(newname, sizeof(newname), "%.255s", a->rename_text);
+
+    XImage *thumb = e->thumb;
+    GdkPixbuf *pb = e->thumb_pixbuf;
+    int tw = e->thumb_w, th = e->thumb_h, trs = e->thumb_req_size, tf = e->thumb_failed;
+    e->thumb = NULL;
+    e->thumb_pixbuf = NULL;
+
+    GError *err = NULL;
+    if (!gfm_rename(e->file, a->rename_text, &err)) {
+        e->thumb = thumb; e->thumb_pixbuf = pb;
+        e->thumb_w = tw; e->thumb_h = th; e->thumb_req_size = trs; e->thumb_failed = tf;
+        rename_cancel(a);
+        show_error(a, "Rename failed", err ? err->message : "Unknown error");
+        if (err) g_error_free(err);
+        return;
+    }
+
+    rename_cancel(a);
+    refresh_listing(a);
+    for (int i = 0; i < a->entry_count; i++) {
+        if (strcmp(a->entries[i].name, newname) == 0) {
+            if (a->entries[i].thumb) XDestroyImage(a->entries[i].thumb);
+            if (a->entries[i].thumb_pixbuf) g_object_unref(a->entries[i].thumb_pixbuf);
+            a->entries[i].thumb = thumb;
+            a->entries[i].thumb_pixbuf = pb;
+            a->entries[i].thumb_w = tw; a->entries[i].thumb_h = th;
+            a->entries[i].thumb_req_size = trs; a->entries[i].thumb_failed = tf;
+            a->list_sel = i; a->entries[i].selected = 1; a->sel_anchor = i;
+            draw_app(a);
             return;
         }
     }
+    if (thumb) XDestroyImage(thumb);
+    if (pb) g_object_unref(pb);
+    draw_app(a);
 }
 
-static void on_bookmark_clicked(GtkButton *button, gpointer data) {
-    App *app = data;
-    if (g_str_equal(g_object_get_data(G_OBJECT(button), "bookmark-action"),
-                    "remove")) {
-        forget_current_bookmark(app);
+static void rename_start(App *a, int index) {
+    if (index < 0 || index >= a->entry_count) return;
+    a->menu_open = 0;
+    a->dialog_open = 0;
+    a->err_open = 0;
+    a->props_open = 0;
+    select_only(a, index);
+    a->rename_active = 1;
+    a->rename_index = index;
+    snprintf(a->rename_text, sizeof(a->rename_text), "%s", a->entries[index].name);
+    a->rename_len = (int)strlen(a->rename_text);
+    a->rename_cursor = a->rename_len;
+    a->caret_on = 1; a->caret_tick = 0;
+    draw_app(a);
+}
+
+static void cb_newfile_ok(void *ud) {
+    App *a = ud;
+    GError *err = NULL;
+    gfm_create_file(a->location, a->dialog_value, &err);
+    if (err) { show_error(a, "Cannot create file", err->message); g_error_free(err); }
+    else refresh_listing(a);
+}
+
+static void cb_newdir_ok(void *ud) {
+    App *a = ud;
+    GError *err = NULL;
+    gfm_create_directory(a->location, a->dialog_value, &err);
+    if (err) { show_error(a, "Cannot create folder", err->message); g_error_free(err); }
+    else refresh_listing(a);
+}
+
+static gboolean run_cmd_in_dir(GFile *dir, char **argv, GError **error) {
+    char *cwd = dir ? g_file_get_path(dir) : NULL;
+    gboolean ok = g_spawn_sync(cwd, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL, NULL, error);
+    g_free(cwd);
+    return ok;
+}
+
+static void extract_archive(App *a, Entry *e) {
+    if (!e || !e->file || !a->location) return;
+    char *path = g_file_get_path(e->file);
+    if (!path) { show_error(a, "Extract failed", "File has no local path"); return; }
+    const char *name = e->name;
+    size_t l = strlen(name);
+    GError *err = NULL;
+    gboolean ok = FALSE;
+    if (l>=4 && strcasecmp(name+l-4, ".zip")==0) {
+        char *argv[] = {"unzip", "-o", path, NULL};
+        ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=4 && strcasecmp(name+l-4, ".rar")==0) {
+        if (has_cmd("unrar")) { char *argv[] = {"unrar", "x", "-o+", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err); }
+        else { char *argv[] = {"7z", "x", "-y", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err); }
+    } else if (l>=3 && strcasecmp(name+l-3, ".7z")==0) {
+        char *argv[] = {"7z", "x", "-y", path, NULL};
+        ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if ((l>=7 && strcasecmp(name+l-7, ".tar.gz")==0) || (l>=4 && strcasecmp(name+l-4, ".tgz")==0)) {
+        char *argv[] = {"tar", "-xzf", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if ((l>=8 && strcasecmp(name+l-8, ".tar.bz2")==0) || (l>=5 && strcasecmp(name+l-5, ".tbz2")==0)) {
+        char *argv[] = {"tar", "-xjf", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if ((l>=7 && strcasecmp(name+l-7, ".tar.xz")==0) || (l>=4 && strcasecmp(name+l-4, ".txz")==0)) {
+        char *argv[] = {"tar", "-xJf", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=8 && strcasecmp(name+l-8, ".tar.zst")==0) {
+        char *argv[] = {"tar", "--zstd", "-xf", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=4 && strcasecmp(name+l-4, ".tar")==0) {
+        char *argv[] = {"tar", "-xf", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=3 && strcasecmp(name+l-3, ".gz")==0) {
+        char *argv[] = {"gunzip", "-k", "-f", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=4 && strcasecmp(name+l-4, ".bz2")==0) {
+        char *argv[] = {"bunzip2", "-k", "-f", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
+    } else if (l>=3 && strcasecmp(name+l-3, ".xz")==0) {
+        char *argv[] = {"unxz", "-k", "-f", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err);
     } else {
-        bookmark_current_location(app);
+        /* try 7z as generic fallback */
+        if (has_cmd("7z")) { char *argv[] = {"7z", "x", "-y", path, NULL}; ok = run_cmd_in_dir(a->location, argv, &err); }
+        else { g_set_error_literal(&err, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "No suitable extractor found"); }
     }
+    g_free(path);
+    if (!ok) { show_error(a, "Extract failed", err ? err->message : "Unknown error"); if (err) g_error_free(err); }
+    else refresh_listing(a);
 }
 
-static void on_new_folder_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    create_item(data, TRUE);
-}
-
-static void on_new_file_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    create_item(data, FALSE);
-}
-
-static void on_list_view_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    app->icon_mode = FALSE;
-    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack), "list");
-    save_config(app);
-}
-
-static void on_icon_view_clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    App *app = data;
-    app->icon_mode = TRUE;
-    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack), "icons");
-    save_config(app);
-}
-
-static GtkWidget *add_button(GtkWidget *box, const gchar *label,
-                             const gchar *operation, App *app) {
-    GtkWidget *button = gtk_button_new_with_label(label);
-    if (operation != NULL) {
-        g_object_set_data(G_OBJECT(button), "operation", (gpointer)operation);
-        g_signal_connect(button, "clicked", G_CALLBACK(on_operation_clicked),
-                         app);
+static void open_with_wine(App *a, Entry *e) {
+    if (!e || !e->file) return;
+    char *path = g_file_get_path(e->file);
+    if (!path) { show_error(a, "Wine", "File has no local path"); return; }
+    GError *err = NULL;
+    char *argv[] = {"wine", path, NULL};
+    if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err)) {
+        show_error(a, "Open with Wine failed", err ? err->message : "Unknown error");
+        if (err) g_error_free(err);
     }
-    gtk_box_pack_start(GTK_BOX(box), button, FALSE, FALSE, 2);
-    return button;
+    g_free(path);
 }
 
-static void add_text_column(GtkTreeView *view, const gchar *title,
-                            gint model_column, gboolean expand) {
-    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
-    GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(
-        title, renderer, "text", model_column, NULL);
-    gtk_tree_view_column_set_resizable(column, TRUE);
-    gtk_tree_view_column_set_expand(column, expand);
-    gtk_tree_view_append_column(view, column);
-}
-
-static void add_name_column(GtkTreeView *view) {
-    GtkCellRenderer *preview = gtk_cell_renderer_pixbuf_new();
-    GtkCellRenderer *text = gtk_cell_renderer_text_new();
-    GtkTreeViewColumn *column = gtk_tree_view_column_new();
-    gtk_tree_view_column_set_title(column, "Name");
-    gtk_tree_view_column_pack_start(column, preview, FALSE);
-    gtk_tree_view_column_add_attribute(column, preview, "pixbuf",
-                                       COL_PREVIEW);
-    gtk_tree_view_column_pack_start(column, text, TRUE);
-    gtk_tree_view_column_add_attribute(column, text, "text", COL_NAME);
-    gtk_tree_view_column_set_resizable(column, TRUE);
-    gtk_tree_view_column_set_expand(column, TRUE);
-    gtk_tree_view_append_column(view, column);
-}
-
-static void sidebar_add_placeholder(App *app, GtkTreeIter *parent) {
-    GtkTreeIter child;
-    gtk_tree_store_append(app->sidebar_store, &child, parent);
-    gtk_tree_store_set(app->sidebar_store, &child, SIDE_NAME, "", SIDE_LOADED,
-                       TRUE, -1);
-}
-
-static void sidebar_add_root(App *app, const gchar *name, GFile *file,
-                             GVolume *volume, GMount *mount) {
-    GtkTreeIter iter;
-    gtk_tree_store_append(app->sidebar_store, &iter, NULL);
-    gtk_tree_store_set(app->sidebar_store, &iter, SIDE_NAME, name, SIDE_FILE,
-                       file, SIDE_VOLUME, volume, SIDE_MOUNT, mount,
-                       SIDE_LOADED, FALSE, -1);
-    GMount *volume_mount = volume != NULL ? g_volume_get_mount(volume) : NULL;
-    if (file != NULL ||
-        (volume != NULL && (g_volume_can_mount(volume) || volume_mount != NULL))) {
-        sidebar_add_placeholder(app, &iter);
-    }
-    g_clear_object(&volume_mount);
-}
-
-static void sidebar_add_shortcut_group(App *app, const gchar *name,
-                                       GPtrArray *files) {
-    GtkTreeIter group;
-    gtk_tree_store_append(app->sidebar_store, &group, NULL);
-    gtk_tree_store_set(app->sidebar_store, &group, SIDE_NAME, name,
-                       SIDE_LOADED, TRUE, -1);
-    for (guint i = 0; files != NULL && i < files->len; i++) {
-        GFile *file = g_ptr_array_index(files, i);
-        gchar *basename = g_file_get_basename(file);
-        if (basename == NULL || basename[0] == '\0') {
-            g_free(basename);
-            basename = gfm_get_path_or_uri(file);
-        }
-        GtkTreeIter shortcut;
-        gtk_tree_store_append(app->sidebar_store, &shortcut, &group);
-        gtk_tree_store_set(app->sidebar_store, &shortcut, SIDE_NAME, basename,
-                           SIDE_FILE, file, SIDE_LOADED, TRUE, -1);
-        g_free(basename);
-    }
-}
-
-static void refresh_sidebar(App *app) {
-    if (app->sidebar_store == NULL) {
-        return;
-    }
-    gtk_tree_store_clear(app->sidebar_store);
-    GFile *home = g_file_new_for_path(g_get_home_dir());
-    GFile *root = g_file_new_for_path(G_DIR_SEPARATOR_S);
-    sidebar_add_root(app, "Home", home, NULL, NULL);
-    sidebar_add_root(app, "File System", root, NULL, NULL);
-    g_object_unref(home);
-    g_object_unref(root);
-    sidebar_add_shortcut_group(app, "Bookmarks", app->bookmarks);
-    sidebar_add_shortcut_group(app, "Recent Locations",
-                               app->recent_locations);
-
-    GList *volumes = g_volume_monitor_get_volumes(app->volume_monitor);
-    for (GList *item = volumes; item != NULL; item = item->next) {
-        GVolume *volume = item->data;
-        GMount *mount = g_volume_get_mount(volume);
-        if (mount != NULL || g_volume_can_mount(volume)) {
-            gchar *name = g_volume_get_name(volume);
-            GFile *mount_root = mount != NULL ? g_mount_get_root(mount) : NULL;
-            sidebar_add_root(app, name, mount_root, volume, mount);
-            g_free(name);
-            g_clear_object(&mount_root);
-        }
-        g_clear_object(&mount);
-    }
-    g_list_free_full(volumes, g_object_unref);
-
-    GList *mounts = g_volume_monitor_get_mounts(app->volume_monitor);
-    for (GList *item = mounts; item != NULL; item = item->next) {
-        GMount *mount = item->data;
-        GVolume *volume = g_mount_get_volume(mount);
-        if (volume == NULL &&
-            (g_mount_can_unmount(mount) || g_mount_can_eject(mount))) {
-            gchar *name = g_mount_get_name(mount);
-            gchar *label = g_strdup_printf("Mounted: %s", name);
-            GFile *mount_root = g_mount_get_root(mount);
-            sidebar_add_root(app, label, mount_root, NULL, mount);
-            g_object_unref(mount_root);
-            g_free(label);
-            g_free(name);
-        }
-        g_clear_object(&volume);
-    }
-    g_list_free_full(mounts, g_object_unref);
-}
-
-static void on_sidebar_row_expanded(GtkTreeView *tree_view, GtkTreeIter *iter,
-                                    GtkTreePath *path, gpointer data) {
-    (void)tree_view;
-    (void)path;
-    App *app = data;
-    gboolean loaded = FALSE;
-    GFile *directory = NULL;
-    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), iter,
-                       SIDE_LOADED, &loaded, SIDE_FILE, &directory, -1);
-    if (loaded || directory == NULL) {
-        g_clear_object(&directory);
-        return;
-    }
-    GtkTreeIter child;
-    while (gtk_tree_model_iter_children(GTK_TREE_MODEL(app->sidebar_store),
-                                        &child, iter)) {
-        gtk_tree_store_remove(app->sidebar_store, &child);
-    }
-    gtk_tree_store_set(app->sidebar_store, iter, SIDE_LOADED, TRUE, -1);
-
-    GError *error = NULL;
-    GFileEnumerator *enumerator = g_file_enumerate_children(
-        directory, G_FILE_ATTRIBUTE_STANDARD_NAME ","
-                   G_FILE_ATTRIBUTE_STANDARD_TYPE,
-        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
-    if (enumerator != NULL) {
-        GFileInfo *info;
-        while ((info = g_file_enumerator_next_file(enumerator, NULL, &error)) !=
-               NULL) {
-            if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
-                const gchar *name = g_file_info_get_name(info);
-                GFile *file = g_file_get_child(directory, name);
-                GtkTreeIter subdirectory;
-                gtk_tree_store_append(app->sidebar_store, &subdirectory, iter);
-                gtk_tree_store_set(app->sidebar_store, &subdirectory,
-                                   SIDE_NAME, name, SIDE_FILE, file,
-                                   SIDE_LOADED, FALSE, -1);
-                sidebar_add_placeholder(app, &subdirectory);
-                g_object_unref(file);
+static void perform_menu(App *a, int id) {
+    Entry *sel = (a->list_sel >= 0 && a->list_sel < a->entry_count)
+                 ? &a->entries[a->list_sel] : NULL;
+    switch (id) {
+    case MENU_OPEN:
+        if (sel) open_entry(a, a->list_sel);
+        break;
+    case MENU_COPY_PATH:
+        if (sel || selected_count(a) > 0) {
+            /* copy filesystem path(s) as plain text */
+            free(a->clipboard_data);
+            a->clipboard_data = NULL;
+            GString *gs = g_string_new(NULL);
+            int count = selected_count(a);
+            if (count > 0) {
+                for (int i = 0; i < a->entry_count; i++) {
+                    if (!a->entries[i].selected) continue;
+                    char *p = g_file_get_path(a->entries[i].file);
+                    if (!p) p = g_file_get_uri(a->entries[i].file);
+                    if (gs->len > 0) g_string_append_c(gs, '\n');
+                    g_string_append(gs, p);
+                    g_free(p);
+                }
+            } else {
+                char *p = g_file_get_path(a->entries[a->list_sel].file);
+                if (!p) p = g_file_get_uri(a->entries[a->list_sel].file);
+                g_string_append(gs, p);
+                g_free(p);
             }
-            g_object_unref(info);
+            a->clipboard_data = g_string_free(gs, FALSE);
+            a->clipboard_is_cut = 0;
+            XSetSelectionOwner(a->dpy, a->atom_clipboard, a->win, CurrentTime);
+            XFlush(a->dpy);
         }
-        if (error != NULL) {
-            g_clear_error(&error);
+        break;
+    case MENU_COPY:
+        if (sel || selected_count(a) > 0) clipboard_set_selected(a, 0);
+        break;
+    case MENU_CUT:
+        if (sel || selected_count(a) > 0) clipboard_set_selected(a, 1);
+        break;
+    case MENU_PASTE:
+        clipboard_paste(a);
+        break;
+    case MENU_COPYTO:
+        if (sel || selected_count(a) > 0) open_picker(a, 0);
+        break;
+    case MENU_MOVETO:
+        if (sel || selected_count(a) > 0) open_picker(a, 1);
+        break;
+    case MENU_RENAME:
+        if (a->list_sel >= 0) rename_start(a, a->list_sel);
+        break;
+    case MENU_TRASH: {
+        int count = selected_count(a);
+        if (count == 0 && !sel) break;
+        GError *err = NULL;
+        gboolean ok = TRUE;
+        if (count > 0) {
+            for (int i = 0; i < a->entry_count; i++) {
+                if (!a->entries[i].selected) continue;
+                g_clear_error(&err);
+                if (!gfm_trash(a->entries[i].file, &err)) ok = FALSE;
+            }
+        } else {
+            if (!gfm_trash(sel->file, &err)) ok = FALSE;
         }
-        g_object_unref(enumerator);
+        if (!ok && err) { show_error(a, "Move to Trash failed", err->message); g_error_free(err); }
+        else if (err) g_error_free(err);
+        refresh_listing(a);
+        break;
     }
-    g_clear_object(&directory);
+    case MENU_DELETE: {
+        int count = selected_count(a);
+        if (count == 0 && !sel) break;
+        GError *err = NULL;
+        gboolean ok = TRUE;
+        if (count > 0) {
+            for (int i = 0; i < a->entry_count; i++) {
+                if (!a->entries[i].selected) continue;
+                g_clear_error(&err);
+                if (!gfm_delete(a->entries[i].file, &err)) ok = FALSE;
+            }
+        } else {
+            if (!gfm_delete(sel->file, &err)) ok = FALSE;
+        }
+        if (!ok && err) { show_error(a, "Delete failed", err->message); g_error_free(err); }
+        else if (err) g_error_free(err);
+        refresh_listing(a);
+        break;
+    }
+    case MENU_PROPS:
+        if (sel) show_props(a, a->list_sel);
+        break;
+    case MENU_NEWFOLDER:
+        start_dialog(a, "New Folder", "Folder name:", cb_newdir_ok);
+        break;
+    case MENU_NEWFILE:
+        start_dialog(a, "New File", "File name:", cb_newfile_ok);
+        break;
+    case MENU_OPEN_WINE:
+        if (sel) open_with_wine(a, sel);
+        break;
+    case MENU_EXTRACT_HERE:
+        if (sel) extract_archive(a, sel);
+        break;
+    case MENU_REFRESH:
+        refresh_listing(a);
+        break;
+    case MENU_VIEW_LIST:
+        a->icon_mode = 0; a->list_scroll = 0; draw_app(a);
+        break;
+    case MENU_VIEW_ICONS:
+        a->icon_mode = 1; a->icon_zoom = 0; a->list_scroll = 0; clear_entry_thumbs(a); draw_app(a);
+        break;
+    case MENU_SORT_NAME: a->sort_mode = SORT_NAME; refresh_listing(a); break;
+    case MENU_SORT_TYPE: a->sort_mode = SORT_TYPE; refresh_listing(a); break;
+    case MENU_SORT_SIZE: a->sort_mode = SORT_SIZE; refresh_listing(a); break;
+    case MENU_SORT_DATE: a->sort_mode = SORT_DATE; refresh_listing(a); break;
+    case MENU_SORT_ASC:  a->sort_desc = 0; refresh_listing(a); break;
+    case MENU_SORT_DESC: a->sort_desc = 1; refresh_listing(a); break;
+    default:
+        break;
+    }
 }
 
-static void on_sidebar_row_activated(GtkTreeView *tree_view, GtkTreePath *path,
-                                    GtkTreeViewColumn *column, gpointer data) {
-    (void)column;
-    App *app = data;
-    GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->sidebar_store), &iter,
-                                 path)) {
+/* ════════════════════════════════════════════════════════════════════
+ * Drawing
+ * ══════════════════════════════════════════════════════════════════*/
+
+/* ── buttons in toolbar ── */
+#define MAX_BTNS 20
+static Btn g_btns[MAX_BTNS];
+static int g_btn_count = 0;
+#define BTN_BACK     0
+#define BTN_FORWARD  1
+#define BTN_UP       2
+#define BTN_GO       3
+#define BTN_HIDDEN   4
+#define BTN_NEWFOLDER 5
+#define BTN_NEWFILE  6
+#define BTN_BM_ADD   7
+#define BTN_BM_REM   8
+#define BTN_VIEW_LIST 9
+#define BTN_VIEW_ICONS 10
+#define BTN_VIEW_LARGE 11
+
+static void layout_buttons(App *a) {
+    g_btn_count = 0;
+    int y0 = bar_y() + (BAR_H - BTN_H) / 2;
+    int x  = PAD;
+
+    /* nav icon buttons */
+    int sw = 28;
+    g_btns[g_btn_count++] = (Btn){x, y0, sw, BTN_H, "", BTN_BACK, UI_ICON_BACK}; x += sw;
+    g_btns[g_btn_count++] = (Btn){x, y0, sw, BTN_H, "", BTN_FORWARD, UI_ICON_FORWARD}; x += sw;
+    g_btns[g_btn_count++] = (Btn){x, y0, sw, BTN_H, "", BTN_UP, UI_ICON_UP}; x += sw + PAD;
+
+    /* address bar — stretchy */
+    int go_w = 28;
+    int addr_w = a->win_w - x - go_w - PAD * 2;
+    if (addr_w < 60) addr_w = 60;
+    g_btns[g_btn_count++] = (Btn){x, y0, addr_w, BTN_H, "", -1, -1};
+    x += addr_w + PAD;
+    g_btns[g_btn_count++] = (Btn){x, y0, go_w, BTN_H, "", BTN_GO, UI_ICON_GO};
+
+    /* toolbar icon buttons */
+    int ty = tool_y() + (TOOL_H - BTN_H) / 2;
+    x = PAD;
+    int ib = 28;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_NEWFOLDER, UI_ICON_NEW_FOLDER}; x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_NEWFILE,   UI_ICON_NEW_FILE};   x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_HIDDEN,    UI_ICON_HIDDEN};     x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_BM_ADD,    UI_ICON_BM_ADD};     x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_BM_REM,    UI_ICON_BM_REMOVE};  x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_VIEW_LIST, UI_ICON_VIEW_LIST};  x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_VIEW_ICONS,UI_ICON_VIEW_ICONS}; x += ib + PAD;
+    g_btns[g_btn_count++] = (Btn){x, ty, ib, BTN_H, "", BTN_VIEW_LARGE,UI_ICON_VIEW_LARGE};
+}
+
+static void draw_address_bar(App *a) {
+    /* background strip */
+    fill_rect(a, &a->panel, 0, bar_y(), a->win_w, BAR_H);
+    draw_line(a, &a->edge, 0, BAR_H - 1, a->win_w, BAR_H - 1);
+
+    for (int i = 0; i < g_btn_count; i++) {
+        Btn *b = &g_btns[i];
+        if (b->y < tool_y()) {
+            if (b->id == -1) {
+                /* address field */
+                fill_rect(a, a->address_focused ? &a->field_on : &a->field,
+                          b->x, b->y, b->w, b->h);
+                draw_rect(a, a->address_focused ? &a->accent : &a->edge,
+                          b->x, b->y, b->w, b->h);
+                int ty2 = b->y + (b->h + a->font->ascent - a->font->descent) / 2;
+                draw_text_clip(a, a->font, &a->text,
+                               b->x + 4, ty2, b->w - 8, a->address);
+                if (a->address_focused && a->caret_on) {
+                    int cw = text_w(a, a->font, a->address);
+                    int maxw = b->w - 10;
+                    if (cw > maxw) cw = maxw;
+                    int cx = b->x + 4 + cw;
+                    draw_line(a, &a->text, cx, b->y + 3, cx, b->y + b->h - 3);
+                }
+            } else {
+                draw_btn(a, b, 0);
+            }
+        }
+    }
+}
+
+static void draw_toolbar(App *a) {
+    fill_rect(a, &a->panel, 0, tool_y(), a->win_w, TOOL_H);
+    draw_line(a, &a->edge, 0, tool_y() + TOOL_H - 1,
+              a->win_w, tool_y() + TOOL_H - 1);
+
+    /* search field — right side of toolbar */
+    int sw_x = a->win_w - 180 - PAD;
+    int sw_y = tool_y() + (TOOL_H - BTN_H) / 2;
+    fill_rect(a, a->search_focused ? &a->field_on : &a->field,
+              sw_x, sw_y, 180, BTN_H);
+    draw_rect(a, a->search_focused ? &a->accent : &a->edge,
+              sw_x, sw_y, 180, BTN_H);
+    if (!a->search[0]) {
+        int ty2 = sw_y + (BTN_H + a->font->ascent - a->font->descent) / 2;
+        draw_text(a, a->font, &a->muted, sw_x + 4, ty2, "Search…");
+    } else {
+        int ty2 = sw_y + (BTN_H + a->font->ascent - a->font->descent) / 2;
+        draw_text_clip(a, a->font, &a->text, sw_x + 4, ty2, 172, a->search);
+        if (a->search_focused && a->caret_on) {
+            int cw = text_w(a, a->font, a->search);
+            if (cw > 168) cw = 168;
+            int cx = sw_x + 4 + cw;
+            draw_line(a, &a->text, cx, sw_y + 3, cx, sw_y + BTN_H - 3);
+        }
+    }
+
+    for (int i = 0; i < g_btn_count; i++) {
+        Btn *b = &g_btns[i];
+        if (b->y >= tool_y() && b->id != -1)
+            draw_btn(a, b, 0);
+    }
+}
+
+static void draw_sidebar(App *a) {
+    fill_rect(a, &a->panel, 0, list_y(), a->side_w, list_h(a));
+    draw_line(a, &a->edge, a->side_w, list_y(),
+              a->side_w, list_y() + list_h(a));
+
+    int y    = list_y();
+    int rows = list_h(a) / a->row_h;
+
+    for (int i = a->side_scroll;
+         i < a->side_count && i < a->side_scroll + rows; i++) {
+        SideEntry *s = &a->side[i];
+        int row_y = y + (i - a->side_scroll) * a->row_h;
+        int indent = s->indent * 14 + PAD;
+
+        int is_group = (s->kind == ST_PLACES_GROUP || s->kind == ST_BM_GROUP ||
+                        s->kind == ST_RECENT_GROUP || s->kind == ST_DEV_GROUP);
+        int is_sel   = (i == a->side_sel && !is_group);
+        int is_drop  = (a->dnd_dragging && i == a->dnd_target_side);
+
+        if (is_drop)
+            fill_rect(a, &a->accent, 0, row_y, a->side_w, a->row_h);
+        else if (is_sel)
+            fill_rect(a, &a->sel, 0, row_y, a->side_w, a->row_h);
+        else if (is_group)
+            fill_rect(a, &a->field, 0, row_y, a->side_w, a->row_h);
+
+        int ty2 = row_y + (a->row_h + a->font->ascent - a->font->descent) / 2;
+        char label[NAME_SIZE + 4];
+        if (s->expandable) {
+            snprintf(label, sizeof(label), "%s %s", s->expanded ? "v" : ">", s->name);
+        } else {
+            snprintf(label, sizeof(label), "%s", s->name);
+        }
+        draw_text_clip(a, is_group ? a->font_bold : a->font,
+                       is_group ? &a->accent : (is_sel ? &a->text : &a->muted),
+                       indent, ty2, a->side_w - indent - PAD, label);
+    }
+}
+
+/* column widths for list view */
+static void col_widths(App *a, int *cname, int *ctype, int *csize) {
+    int w = list_w(a);
+    *ctype = 70;
+    *csize = 80;
+    *cname = w - *ctype - *csize;
+    if (*cname < 60) *cname = 60;
+}
+
+static void draw_list_header(App *a) {
+    int x  = list_x(a);
+    int y  = list_y();
+    int cname, ctype, csize;
+    col_widths(a, &cname, &ctype, &csize);
+
+    fill_rect(a, &a->field, x, y, list_w(a), a->row_h);
+    draw_line(a, &a->edge, x, y + a->row_h, x + list_w(a), y + a->row_h);
+
+    int ty2 = y + (a->row_h + a->font_bold->ascent - a->font_bold->descent) / 2;
+    draw_text(a, a->font_bold, &a->accent, x + PAD, ty2, "Name");
+    draw_text(a, a->font_bold, &a->accent, x + cname + PAD, ty2, "Type");
+    draw_text(a, a->font_bold, &a->accent, x + cname + ctype + PAD, ty2, "Size");
+
+    draw_line(a, &a->edge, x + cname, y, x + cname, y + a->row_h);
+    draw_line(a, &a->edge, x + cname + ctype, y, x + cname + ctype, y + a->row_h);
+}
+
+static void icon_grid(App *a, int *cols, int *cell_w, int *cell_h) {
+    int thumb = icon_thumb_size(a);
+    *cell_w = thumb + PAD * 4;
+    *cell_h = thumb + a->row_h + PAD * 2;
+    if (*cell_w < 60) *cell_w = 60;
+    if (*cell_h < 60) *cell_h = 60;
+    *cols = list_w(a) / *cell_w;
+    if (*cols < 1) *cols = 1;
+}
+
+static void draw_copy_status(App *a, int x, int w) {
+    pthread_mutex_lock(&a->copy_mutex);
+    int running = a->copy_running;
+    double frac = a->copy_fraction;
+    char cur[TEXT_SIZE]; snprintf(cur, sizeof(cur), "%s", a->copy_current);
+    char cerr[TEXT_SIZE]; snprintf(cerr, sizeof(cerr), "%s", a->copy_error);
+    pthread_mutex_unlock(&a->copy_mutex);
+
+    if (!(running || cerr[0])) return;
+    int bary = a->win_h - STATUS_H - 18;
+    if (bary < list_y()) bary = list_y();
+    fill_rect(a, &a->panel, x, bary, w, 18);
+    if (running) {
+        int pw = (int)((w - 2) * frac);
+        fill_rect(a, &a->sel, x + 1, bary + 2, pw, 14);
+        char msg[TEXT_SIZE];
+        snprintf(msg, sizeof(msg), "Copying: %.480s", cur);
+        draw_text_clip(a, a->font, &a->text, x + 4, bary + 14, w - 8, msg);
+    } else if (cerr[0]) {
+        draw_text_clip(a, a->font, &a->accent, x + 4, bary + 14, w - 8, cerr);
+    }
+}
+
+static void draw_list_view(App *a) {
+    int cname, ctype, csize;
+    col_widths(a, &cname, &ctype, &csize);
+
+    int x    = list_x(a);
+    int y0   = list_y() + a->row_h; /* below header */
+    int rows = (list_h(a) - a->row_h) / a->row_h;
+    if (rows < 1) rows = 1;
+    int end  = a->list_scroll + rows;
+    if (end > a->entry_count) end = a->entry_count;
+
+    fill_rect(a, &a->bg, x, y0, list_w(a), list_h(a) - a->row_h);
+
+    for (int i = a->list_scroll; i < end; i++) {
+        Entry *e = &a->entries[i];
+        int row_y = y0 + (i - a->list_scroll) * a->row_h;
+
+        int is_drop_target = (a->dnd_dragging && i == a->dnd_target_item);
+        if (is_drop_target)
+            fill_rect(a, &a->accent, x, row_y, list_w(a), a->row_h);
+        else if (e->selected || i == a->list_sel)
+            fill_rect(a, &a->sel, x, row_y, list_w(a), a->row_h);
+        else if ((i - a->list_scroll) % 2 == 1)
+            fill_rect(a, &a->field, x, row_y, list_w(a), a->row_h);
+
+        int ty2 = row_y + (a->row_h + a->font->ascent - a->font->descent) / 2;
+        XftColor *tc = e->ftype == FT_DIR ? &a->accent : &a->text;
+
+        if (a->rename_active && a->rename_index == i) {
+            int rx = x + PAD - 2;
+            int ry = row_y + 2;
+            int rw = cname - 2 * PAD + 4;
+            int rh = a->row_h - 4;
+            fill_rect(a, &a->field_on, rx, ry, rw, rh);
+            draw_rect(a, &a->accent, rx, ry, rw, rh);
+            draw_text_clip(a, a->font, &a->text, rx + 2, ty2, rw - 4, a->rename_text);
+            if (a->caret_on) {
+                int cw = text_w(a, a->font, a->rename_text);
+                if (cw > rw - 6) cw = rw - 6;
+                int cx = rx + 2 + cw;
+                draw_line(a, &a->text, cx, ry + 2, cx, ry + rh - 2);
+            }
+        } else {
+            draw_text_clip(a, a->font, tc, x + PAD, ty2, cname - 2 * PAD, e->name);
+        }
+        draw_text_clip(a, a->font, &a->muted, x + cname + PAD, ty2, ctype - PAD, e->type_str);
+        draw_text_clip(a, a->font, &a->muted, x + cname + ctype + PAD, ty2, csize - PAD, e->size);
+
+        draw_line(a, &a->edge, x + cname, row_y, x + cname, row_y + a->row_h);
+        draw_line(a, &a->edge, x + cname + ctype, row_y, x + cname + ctype, row_y + a->row_h);
+    }
+
+    if (a->entry_count > rows) {
+        int sx = list_x(a) + list_w(a);
+        int sh = list_h(a) - a->row_h;
+        fill_rect(a, &a->field, sx, y0, SCROLL_W, sh);
+        int thumb_h = sh * rows / a->entry_count;
+        if (thumb_h < 16) thumb_h = 16;
+        int max_scroll = a->entry_count - rows;
+        if (max_scroll < 1) max_scroll = 1;
+        int thumb_y = y0 + (sh - thumb_h) * a->list_scroll / max_scroll;
+        fill_rect(a, &a->edge, sx + 2, thumb_y, SCROLL_W - 4, thumb_h);
+    }
+
+    draw_copy_status(a, x, list_w(a));
+}
+
+static void draw_icon_view(App *a) {
+    g_thumb_load_budget = 4; /* limit decodes per frame to keep UI responsive */
+    int cols, cell_w, cell_h;
+    icon_grid(a, &cols, &cell_w, &cell_h);
+    int x0 = list_x(a);
+    int y0 = list_y();
+    int w = list_w(a);
+    int h = list_h(a);
+    fill_rect(a, &a->bg, x0, y0, w, h);
+
+    int grid_w = cols * cell_w;
+    int xoff = (w - grid_w) / 2;
+    if (xoff < 0) xoff = 0;
+
+    int vis_rows = h / cell_h;
+    if (vis_rows < 1) vis_rows = 1;
+    int start = a->list_scroll * cols;
+    int end = start + vis_rows * cols;
+    if (end > a->entry_count) end = a->entry_count;
+
+    for (int i = start; i < end; i++) {
+        int idx = i - start;
+        int col = idx % cols;
+        int row = idx / cols;
+        int cx = x0 + xoff + col * cell_w;
+        int cy = y0 + row * cell_h;
+        Entry *e = &a->entries[i];
+
+        int is_drop_target = (a->dnd_dragging && i == a->dnd_target_item);
+        if (is_drop_target) {
+            fill_rect(a, &a->accent, cx + 4, cy + 4, cell_w - 8, cell_h - 8);
+            draw_rect(a, &a->edge, cx + 4, cy + 4, cell_w - 8, cell_h - 8);
+        } else if (e->selected || i == a->list_sel) {
+            fill_rect(a, &a->sel, cx + 4, cy + 4, cell_w - 8, cell_h - 8);
+            draw_rect(a, &a->edge, cx + 4, cy + 4, cell_w - 8, cell_h - 8);
+        }
+
+        int thumb = icon_thumb_size(a);
+        int ty = cy + PAD;
+
+        if (e->ftype == FT_DIR) {
+            int fw = thumb * 3 / 4, fh = thumb / 2;
+            int fx = cx + (cell_w - fw) / 2;
+            int fy = ty + (thumb - fh) / 2;
+            fill_rect(a, &a->field_on, fx, fy, fw, fh);
+            draw_rect(a, &a->accent, fx, fy, fw, fh);
+            draw_rect(a, &a->accent, fx, fy - fh / 5, fw / 2, fh / 5 + 1);
+        } else {
+            ensure_entry_thumb(a, e);
+            if (e->thumb) {
+                int ix = cx + (cell_w - e->thumb_w) / 2;
+                int iy = ty + (thumb - e->thumb_h) / 2;
+                XPutImage(a->dpy, draw_target(a), a->gc, e->thumb, 0, 0, ix, iy,
+                          (unsigned)e->thumb_w, (unsigned)e->thumb_h);
+            } else {
+                int fw = thumb / 2, fh = thumb * 2 / 3;
+                int fx = cx + (cell_w - fw) / 2;
+                int fy = ty + (thumb - fh) / 2;
+                fill_rect(a, &a->field, fx, fy, fw, fh);
+                draw_rect(a, &a->muted, fx, fy, fw, fh);
+            }
+        }
+
+        int ly = cy + PAD + thumb + (a->row_h + a->font->ascent - a->font->descent) / 2;
+        XftColor *tc = e->ftype == FT_DIR ? &a->accent : &a->text;
+        int max_tw = cell_w - 2 * PAD;
+        if (a->rename_active && a->rename_index == i) {
+            int rw = max_tw;
+            int rx = cx + (cell_w - rw) / 2;
+            int ry = cy + PAD + thumb + 1;
+            int rh = a->row_h;
+            fill_rect(a, &a->field_on, rx, ry, rw, rh);
+            draw_rect(a, &a->accent, rx, ry, rw, rh);
+            draw_text_clip(a, a->font, &a->text, rx + 2, ly, rw - 4, a->rename_text);
+            if (a->caret_on) {
+                int cw = text_w(a, a->font, a->rename_text);
+                if (cw > rw - 6) cw = rw - 6;
+                int cxr = rx + 2 + cw;
+                draw_line(a, &a->text, cxr, ry + 2, cxr, ry + rh - 2);
+            }
+        } else {
+            int tw = text_w(a, a->font, e->name);
+            if (tw > max_tw) tw = max_tw;
+            int tx = cx + (cell_w - tw) / 2;
+            draw_text_clip(a, a->font, tc, tx, ly, max_tw, e->name);
+        }
+    }
+
+    int total_rows = (a->entry_count + cols - 1) / cols;
+    if (total_rows > vis_rows) {
+        int sx = list_x(a) + list_w(a);
+        fill_rect(a, &a->field, sx, y0, SCROLL_W, h);
+        int thumb_h = h * vis_rows / total_rows;
+        if (thumb_h < 16) thumb_h = 16;
+        int max_scroll = total_rows - vis_rows;
+        if (max_scroll < 1) max_scroll = 1;
+        int thumb_y = y0 + (h - thumb_h) * a->list_scroll / max_scroll;
+        fill_rect(a, &a->edge, sx + 2, thumb_y, SCROLL_W - 4, thumb_h);
+    }
+
+    draw_copy_status(a, x0, w);
+}
+
+static void draw_listing(App *a) {
+    if (a->icon_mode) draw_icon_view(a);
+    else draw_list_view(a);
+}
+
+static void draw_menu(App *a) {
+    if (!a->menu_open) return;
+    int count = g_menu_count;
+    int mw = 240, mh = count * a->row_h + 4;
+    int mx = a->menu_x, my = a->menu_y;
+    if (mx + mw > a->win_w) mx = a->win_w - mw;
+    if (my + mh > a->win_h) my = a->win_h - mh;
+
+    fill_rect(a, &a->panel, mx, my, mw, mh);
+    draw_rect(a, &a->edge, mx, my, mw, mh);
+
+    for (int i = 0; i < count; i++) {
+        int iy = my + 2 + i * a->row_h;
+        if (g_menu_items[i].id == MENU_NONE) {
+            int ly = iy + a->row_h / 2;
+            draw_line(a, &a->edge, mx + 6, ly, mx + mw - 6, ly);
+            continue;
+        }
+        if (i == a->menu_sel)
+            fill_rect(a, &a->sel, mx + 1, iy, mw - 2, a->row_h);
+        int ty2 = iy + (a->row_h + a->font->ascent - a->font->descent) / 2;
+        int tx = mx + PAD;
+        if (g_menu_items[i].icon && g_menu_items[i].icon[0]) {
+            draw_text(a, a->font, &a->accent, tx, ty2, g_menu_items[i].icon);
+            tx += 22;
+        }
+        draw_text(a, a->font, &a->text, tx, ty2, g_menu_items[i].label);
+    }
+}
+
+static void draw_dialog(App *a) {
+    if (!a->dialog_open) return;
+    int dw = 480, dh = 160;
+    int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+    fill_rect(a, &a->panel, dx, dy, dw, dh);
+    draw_rect(a, &a->edge, dx, dy, dw, dh);
+
+    draw_text(a, a->font_bold, &a->accent, dx + PAD, dy + 20, a->dialog_title);
+    draw_text(a, a->font, &a->text, dx + PAD, dy + 48, a->dialog_prompt);
+
+    /* input field */
+    fill_rect(a, &a->field_on, dx + PAD, dy + 58, dw - 2*PAD, BTN_H + 4);
+    draw_rect(a, &a->accent, dx + PAD, dy + 58, dw - 2*PAD, BTN_H + 4);
+    int ty2 = dy + 58 + (BTN_H + 4 + a->font->ascent - a->font->descent) / 2;
+    draw_text_clip(a, a->font, &a->text, dx + PAD + 4, ty2,
+                   dw - 2*PAD - 8, a->dialog_value);
+    if (a->caret_on) {
+        int cw = text_w(a, a->font, a->dialog_value);
+        int maxw = dw - 2*PAD - 10;
+        if (cw > maxw) cw = maxw;
+        int cx = dx + PAD + 4 + cw;
+        draw_line(a, &a->text, cx, dy + 58 + 3, cx, dy + 58 + BTN_H + 1);
+    }
+
+    /* buttons */
+    Btn ok_btn  = {dx + dw - 70 - PAD, dy + dh - BTN_H - PAD,
+                   64, BTN_H, "OK", 0, -1};
+    Btn can_btn = {dx + dw - 70 - PAD - 70, dy + dh - BTN_H - PAD,
+                   64, BTN_H, "Cancel", 1, -1};
+    draw_btn(a, &ok_btn, 0);
+    draw_btn(a, &can_btn, 0);
+
+    draw_text(a, a->font, &a->muted, dx + PAD,
+              dy + dh - 6, "Enter = confirm, Escape = cancel");
+}
+
+static void draw_error(App *a) {
+    if (!a->err_open) return;
+    int dw = 480, dh = 140;
+    int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+    fill_rect(a, &a->panel, dx, dy, dw, dh);
+    draw_rect(a, &a->edge, dx, dy, dw, dh);
+
+    draw_text(a, a->font_bold, &a->accent, dx + PAD, dy + 22, a->err_text);
+    if (a->err_detail[0])
+        draw_text_clip(a, a->font, &a->muted, dx + PAD, dy + 46,
+                       dw - 2*PAD, a->err_detail);
+
+    draw_text(a, a->font, &a->muted, dx + PAD,
+              dy + dh - 8, "Press Enter or click anywhere to close");
+}
+
+static void draw_props(App *a) {
+    if (!a->props_open) return;
+    int dw = 420, dh = 240;
+    int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+    fill_rect(a, &a->panel, dx, dy, dw, dh);
+    draw_rect(a, &a->edge, dx, dy, dw, dh);
+
+    draw_text(a, a->font_bold, &a->accent, dx + PAD, dy + 22, "Properties");
+
+    int y = dy + 44;
+    int lx = dx + PAD, vx = dx + 100;
+#define PROP_ROW(label, val) \
+    draw_text(a, a->font, &a->muted, lx, y, label); \
+    draw_text_clip(a, a->font, &a->text, vx, y, dw - 100 - PAD, val); \
+    y += 20;
+    PROP_ROW("Name:",     a->props_path)
+    PROP_ROW("Type:",     a->props_type)
+    PROP_ROW("Size:",     a->props_size)
+    PROP_ROW("Modified:", a->props_mtime)
+#undef PROP_ROW
+
+    if (a->props_has_mode) {
+        char perm[12] = "---------";
+        for (int i = 0; i < 9; i++) {
+            int bit = (a->props_mode >> (8 - i)) & 1;
+            if (bit) perm[i] = "rwxrwxrwx"[i];
+        }
+        draw_text(a, a->font, &a->muted, lx, y, "Mode:");
+        draw_text(a, a->font, &a->text, vx, y, perm);
+        y += 20;
+    }
+
+    Btn close_btn = {dx + dw - 74, dy + dh - BTN_H - PAD,
+                     68, BTN_H, "Close", 0, -1};
+    draw_btn(a, &close_btn, 0);
+}
+
+static void draw_picker(App *a) {
+    if (!a->picker_open) return;
+    int dw = a->win_w * 2 / 3; if (dw < 420) dw = 420; if (dw > a->win_w - 40) dw = a->win_w - 40;
+    int dh = a->win_h * 2 / 3; if (dh < 300) dh = 300; if (dh > a->win_h - 40) dh = a->win_h - 40;
+    int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+    fill_rect(a, &a->panel, dx, dy, dw, dh);
+    draw_rect(a, &a->edge, dx, dy, dw, dh);
+
+    const char *title = a->picker_move ? "➜ Move to" : "⎘ Copy to";
+    draw_text(a, a->font_bold, &a->accent, dx + PAD, dy + 20, title);
+
+    char *pstr = a->picker_dir ? g_file_get_path(a->picker_dir) : NULL;
+    if (!pstr && a->picker_dir) pstr = g_file_get_uri(a->picker_dir);
+    char loc[TEXT_SIZE]; snprintf(loc, sizeof(loc), "%s", pstr ? pstr : "");
+    g_free(pstr);
+    draw_text_clip(a, a->font, &a->muted, dx + PAD, dy + 40, dw - 2*PAD, loc);
+
+    /* buttons */
+    int by = dy + dh - BTN_H - PAD;
+    Btn sel_btn = {dx + dw - PAD - 90, by, 90, BTN_H, "✓ Select", 100, -1};
+    Btn up_btn  = {dx + dw - PAD - 90 - 58, by, 52, BTN_H, "↑ Up", 101, -1};
+    Btn home_btn= {dx + dw - PAD - 90 - 58 - 64, by, 58, BTN_H, "⌂ Home", 102, -1};
+    Btn can_btn = {dx + PAD, by, 64, BTN_H, "✖", 103, -1};
+    draw_btn(a, &sel_btn, 0);
+    draw_btn(a, &up_btn, 0);
+    draw_btn(a, &home_btn, 0);
+    draw_btn(a, &can_btn, 0);
+
+    /* list area */
+    int lx = dx + PAD, ly = dy + 52;
+    int lw = dw - 2*PAD, lh = by - ly - PAD;
+    fill_rect(a, &a->bg, lx, ly, lw, lh);
+    draw_rect(a, &a->edge, lx, ly, lw, lh);
+    int rows = lh / a->row_h; if (rows < 1) rows = 1;
+    int end = a->picker_scroll + rows;
+    if (end > a->picker_count) end = a->picker_count;
+    for (int i = a->picker_scroll; i < end; i++) {
+        int ry = ly + (i - a->picker_scroll) * a->row_h;
+        if (i == a->picker_sel) fill_rect(a, &a->sel, lx+1, ry+1, lw-2, a->row_h-1);
+        int ty = ry + (a->row_h + a->font->ascent - a->font->descent) / 2;
+        draw_text_clip(a, a->font, &a->text, lx + PAD, ty, lw - 2*PAD, a->picker_names[i]);
+    }
+}
+
+static void ensure_backbuf(App *a) {
+    if (!a->dpy || !a->win) return;
+    if (a->win_w < 1) a->win_w = 1;
+    if (a->win_h < 1) a->win_h = 1;
+    if (a->backbuf) return;
+    a->backbuf = XCreatePixmap(a->dpy, a->win, (unsigned)a->win_w, (unsigned)a->win_h,
+                               (unsigned)DefaultDepth(a->dpy, a->scr));
+    if (a->draw) XftDrawDestroy(a->draw);
+    a->draw = XftDrawCreate(a->dpy, a->backbuf,
+                            DefaultVisual(a->dpy, a->scr),
+                            DefaultColormap(a->dpy, a->scr));
+}
+
+static void recreate_backbuf(App *a) {
+    if (a->draw) { XftDrawDestroy(a->draw); a->draw = NULL; }
+    if (a->backbuf) { XFreePixmap(a->dpy, a->backbuf); a->backbuf = 0; }
+    ensure_backbuf(a);
+}
+
+
+static void draw_status_bar(App *a) {
+    int y = a->win_h - STATUS_H;
+    if (y < 0) y = 0;
+    fill_rect(a, &a->panel, 0, y, a->win_w, STATUS_H);
+    draw_line(a, &a->edge, 0, y, a->win_w, y);
+    int ty = y + (STATUS_H + a->font->ascent - a->font->descent) / 2;
+    draw_text_clip(a, a->font, &a->muted, PAD, ty, a->win_w - 2*PAD, a->free_space);
+}
+
+static void draw_app(App *a) {
+    ensure_backbuf(a);
+    fill_rect(a, &a->bg, 0, 0, a->win_w, a->win_h);
+    if (a->layout_w != a->win_w || a->layout_h != a->win_h || a->layout_side_w != a->side_w) {
+        layout_buttons(a);
+        a->layout_w = a->win_w;
+        a->layout_h = a->win_h;
+        a->layout_side_w = a->side_w;
+    }
+    draw_address_bar(a);
+    draw_toolbar(a);
+    draw_sidebar(a);
+    if (!a->icon_mode) draw_list_header(a);
+    draw_listing(a);
+
+    /* split handle */
+    draw_line(a, &a->edge, a->side_w + 1, list_y(),
+              a->side_w + 1, list_y() + list_h(a));
+    draw_status_bar(a);
+
+    if (a->menu_open)   draw_menu(a);
+    if (a->dialog_open) draw_dialog(a);
+    if (a->picker_open) draw_picker(a);
+    if (a->props_open)  draw_props(a);
+    if (a->err_open)    draw_error(a);
+
+    /* rubber-band selection */
+    if (a->band_active) {
+        int x1 = a->band_x0 < a->band_x1 ? a->band_x0 : a->band_x1;
+        int y1 = a->band_y0 < a->band_y1 ? a->band_y0 : a->band_y1;
+        int x2 = a->band_x0 > a->band_x1 ? a->band_x0 : a->band_x1;
+        int y2 = a->band_y0 > a->band_y1 ? a->band_y0 : a->band_y1;
+        int bw = x2 - x1, bh = y2 - y1;
+        if (bw > 0 && bh > 0) {
+            draw_rect(a, &a->accent, x1, y1, bw, bh);
+            if (bw > 2 && bh > 2) draw_rect(a, &a->edge, x1 + 1, y1 + 1, bw - 2, bh - 2);
+        }
+    }
+
+    /* drag ghost is shown via external drag icon window */
+
+    XCopyArea(a->dpy, a->backbuf, a->win, a->gc, 0, 0,
+              (unsigned)a->win_w, (unsigned)a->win_h, 0, 0);
+    XFlush(a->dpy);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Hit-testing helpers
+ * ══════════════════════════════════════════════════════════════════*/
+static int hit_btn(int x, int y, int *btn_id) {
+    for (int i = 0; i < g_btn_count; i++) {
+        Btn *b = &g_btns[i];
+        if (x >= b->x && x < b->x + b->w &&
+            y >= b->y && y < b->y + b->h) {
+            *btn_id = b->id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int item_at(App *a, int x, int y) {
+    if (x < list_x(a) || x > list_x(a) + list_w(a)) return -1;
+    if (a->icon_mode) {
+        int cols, cell_w, cell_h;
+        icon_grid(a, &cols, &cell_w, &cell_h);
+        int grid_w = cols * cell_w;
+        int xoff = (list_w(a) - grid_w) / 2;
+        if (xoff < 0) xoff = 0;
+        if (y < list_y() || y > list_y() + list_h(a)) return -1;
+        int col = (x - list_x(a) - xoff) / cell_w;
+        int row = (y - list_y()) / cell_h + a->list_scroll;
+        if (col < 0 || col >= cols) return -1;
+        int idx = row * cols + col;
+        if (idx >= 0 && idx < a->entry_count) return idx;
+        return -1;
+    } else {
+        if (y < list_y() + a->row_h) return -1;    /* header */
+        int row = (y - (list_y() + a->row_h)) / a->row_h + a->list_scroll;
+        if (row >= 0 && row < a->entry_count) return row;
+        return -1;
+    }
+}
+
+static int side_row_at(App *a, int x, int y) {
+    if (x < 0 || x > a->side_w) return -1;
+    if (y < list_y()) return -1;
+    int row = (y - list_y()) / a->row_h + a->side_scroll;
+    if (row >= 0 && row < a->side_count) return row;
+    return -1;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Address bar commit
+ * ══════════════════════════════════════════════════════════════════*/
+static void address_commit(App *a) {
+    if (!a->address[0]) return;
+    char expanded[PATH_MAX];
+    if (strcmp(a->address, "~") == 0 ||
+        strncmp(a->address, "~/", 2) == 0) {
+        const char *home = g_get_home_dir();
+        if (strcmp(a->address, "~") == 0)
+            snprintf(expanded, sizeof(expanded), "%s", home);
+        else
+            snprintf(expanded, sizeof(expanded), "%s%s", home, a->address + 1);
+    } else {
+        snprintf(expanded, sizeof(expanded), "%s", a->address);
+    }
+    GFile *f = g_file_new_for_commandline_arg(expanded);
+    go_to(a, f, 1);
+    g_object_unref(f);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Keyboard input into text fields
+ * ══════════════════════════════════════════════════════════════════*/
+static void field_key(char *buf, int *len, int max_len,
+                      KeySym sym, const char *input, int input_len) {
+    if (sym == XK_BackSpace) {
+        if (*len > 0) {
+            (*len)--;
+            while (*len > 0 && ((unsigned char)buf[*len] & 0xc0) == 0x80)
+                (*len)--;
+            buf[*len] = '\0';
+        }
         return;
     }
-    GFile *file = NULL;
-    GVolume *volume = NULL;
-    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &iter,
-                       SIDE_FILE, &file, SIDE_VOLUME, &volume, -1);
-    if (file != NULL) {
-        go_to(app, file, TRUE);
-    } else if (volume != NULL && g_volume_can_mount(volume)) {
-        g_volume_mount(volume, G_MOUNT_MOUNT_NONE, NULL, NULL,
-                       on_volume_mounted, app);
+    for (int i = 0; i < input_len && *len < max_len - 1; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c >= 32 || c >= 0x80) buf[(*len)++] = (char)c;
     }
-    g_clear_object(&file);
-    g_clear_object(&volume);
-    (void)tree_view;
+    buf[*len] = '\0';
 }
 
-static void on_volume_mounted(GObject *source, GAsyncResult *result,
-                              gpointer data) {
-    App *app = data;
-    GError *error = NULL;
-    if (!g_volume_mount_finish(G_VOLUME(source), result, &error)) {
-        show_error(app, "Could not mount this device.", error);
-        g_clear_error(&error);
+/* ════════════════════════════════════════════════════════════════════
+ * Event handling
+ * ══════════════════════════════════════════════════════════════════*/
+static void handle_key(App *a, XKeyEvent *ev) {
+    char input[32]; KeySym sym;
+    int len = XLookupString(ev, input, sizeof(input)-1, &sym, NULL);
+    input[len] = '\0';
+
+    int ctrl = !!(ev->state & ControlMask);
+
+    /* error dialog */
+    if (a->err_open) {
+        if (sym == XK_Return || sym == XK_Escape) a->err_open = 0;
+        draw_app(a); return;
+    }
+    /* inline rename */
+    if (a->rename_active) {
+        if (sym == XK_Return) {
+            rename_commit(a);
+        } else if (sym == XK_Escape) {
+            rename_cancel(a);
+            draw_app(a);
+        } else if (sym == XK_Left || sym == XK_Right || sym == XK_Home || sym == XK_End) {
+            /* keep cursor at end for now */
+            a->rename_cursor = a->rename_len;
+            draw_app(a);
+        } else {
+            field_key(a->rename_text, &a->rename_len,
+                      (int)sizeof(a->rename_text), sym, input, len);
+            a->rename_cursor = a->rename_len;
+            a->caret_on = 1; a->caret_tick = 0;
+            draw_app(a);
+        }
         return;
     }
-    GMount *mount = g_volume_get_mount(G_VOLUME(source));
-    if (mount != NULL) {
-        GFile *root = g_mount_get_root(mount);
-        go_to(app, root, TRUE);
-        g_object_unref(root);
-        g_object_unref(mount);
+    /* input dialog */
+    if (a->dialog_open) {
+        if (sym == XK_Return) {
+            if (a->dialog_len > 0 && a->dialog_ok) a->dialog_ok(a);
+            a->dialog_open = 0;
+        } else if (sym == XK_Escape) {
+            a->dialog_open = 0;
+        } else {
+            field_key(a->dialog_value, &a->dialog_len,
+                      (int)sizeof(a->dialog_value), sym, input, len);
+            a->caret_on = 1; a->caret_tick = 0;
+        }
+        draw_app(a); return;
     }
-    refresh_sidebar(app);
+    /* directory picker */
+    if (a->picker_open) {
+        if (sym == XK_Escape) {
+            close_picker(a);
+        } else if (sym == XK_Return) {
+            if (a->picker_sel >= 0 && a->picker_sel < a->picker_count)
+                picker_refresh(a, a->picker_files[a->picker_sel]);
+            else
+                picker_select_current(a);
+        } else if (sym == XK_BackSpace) {
+            if (a->picker_dir) {
+                GFile *parent = g_file_get_parent(a->picker_dir);
+                if (parent) { picker_refresh(a, parent); g_object_unref(parent); }
+            }
+        } else if (sym == XK_Up) {
+            if (a->picker_sel > 0) { a->picker_sel--; if (a->picker_sel < a->picker_scroll) a->picker_scroll = a->picker_sel; }
+        } else if (sym == XK_Down) {
+            if (a->picker_sel < a->picker_count - 1) {
+                a->picker_sel++;
+                int dw = a->win_w * 2 / 3; if (dw < 420) dw = 420; if (dw > a->win_w - 40) dw = a->win_w - 40;
+                int dh = a->win_h * 2 / 3; if (dh < 300) dh = 300; if (dh > a->win_h - 40) dh = a->win_h - 40;
+                int dy = (a->win_h - dh) / 2, by = dy + dh - BTN_H - PAD, ly = dy + 52;
+                int rows = (by - ly - PAD) / a->row_h; if (rows < 1) rows = 1;
+                if (a->picker_sel >= a->picker_scroll + rows) a->picker_scroll = a->picker_sel - rows + 1;
+            }
+        }
+        draw_app(a); return;
+    }
+    /* props dialog */
+    if (a->props_open) {
+        if (sym == XK_Return || sym == XK_Escape) {
+            a->props_open = 0;
+            if (a->props_file) { g_object_unref(a->props_file); a->props_file = NULL; }
+        }
+        draw_app(a); return;
+    }
+    /* menu */
+    if (a->menu_open) {
+        a->menu_open = 0; draw_app(a); return;
+    }
+
+    /* address bar */
+    if (a->address_focused) {
+        if (sym == XK_Return) {
+            address_commit(a);
+            a->address_focused = 0;
+        } else if (sym == XK_Escape) {
+            a->address_focused = 0;
+            if (a->location) address_set(a, a->location);
+        } else {
+            field_key(a->address, &a->address_len,
+                      (int)sizeof(a->address), sym, input, len);
+            a->caret_on = 1; a->caret_tick = 0;
+        }
+        draw_app(a); return;
+    }
+    /* search */
+    if (a->search_focused) {
+        if (sym == XK_Return || sym == XK_Escape) {
+            a->search_focused = 0;
+        } else {
+            field_key(a->search, &a->search_len,
+                      (int)sizeof(a->search), sym, input, len);
+            a->caret_on = 1; a->caret_tick = 0;
+            refresh_listing(a);
+        }
+        draw_app(a); return;
+    }
+
+    /* global shortcuts */
+    if (ctrl) {
+        switch (sym) {
+        case XK_l: a->address_focused = 1; a->search_focused = 0; a->caret_on = 1; a->caret_tick = 0; break;
+        case XK_h: a->show_hidden = !a->show_hidden; refresh_listing(a); break;
+        case XK_a: select_all(a); break;
+        case XK_c: if (a->list_sel >= 0 || selected_count(a) > 0) clipboard_set_selected(a, 0); break;
+        case XK_x: if (a->list_sel >= 0 || selected_count(a) > 0) clipboard_set_selected(a, 1); break;
+        case XK_v: clipboard_paste(a); break;
+        case XK_n: start_dialog(a, "New File", "File name:", cb_newfile_ok); break;
+        case XK_N: start_dialog(a, "New Folder", "Folder name:", cb_newdir_ok); break;
+        case XK_1: a->icon_mode = 0; a->list_scroll = 0; break;
+        case XK_2: a->icon_mode = 1; a->list_scroll = 0; clear_entry_thumbs(a); break;
+        }
+        draw_app(a); return;
+    }
+
+    switch (sym) {
+    case XK_Up:
+    case XK_Down:
+    case XK_Left:
+    case XK_Right:
+    case XK_Home:
+    case XK_End:
+    case XK_Page_Up:
+    case XK_Page_Down: {
+        if (a->entry_count <= 0) break;
+        int idx = a->list_sel < 0 ? 0 : a->list_sel;
+        if (a->icon_mode) {
+            int cols, cw, ch;
+            icon_grid(a, &cols, &cw, &ch);
+            int vis_rows = list_h(a) / ch; if (vis_rows < 1) vis_rows = 1;
+            int total_rows = (a->entry_count + cols - 1) / cols;
+            if (sym == XK_Up) idx -= cols;
+            else if (sym == XK_Down) idx += cols;
+            else if (sym == XK_Left) idx -= 1;
+            else if (sym == XK_Right) idx += 1;
+            else if (sym == XK_Home) idx = 0;
+            else if (sym == XK_End) idx = a->entry_count - 1;
+            else if (sym == XK_Page_Up) idx -= cols * vis_rows;
+            else if (sym == XK_Page_Down) idx += cols * vis_rows;
+            if (idx < 0) idx = 0;
+            if (idx >= a->entry_count) idx = a->entry_count - 1;
+            select_only(a, idx);
+            int sel_row = idx / cols;
+            if (sel_row < a->list_scroll) a->list_scroll = sel_row;
+            if (sel_row >= a->list_scroll + vis_rows) a->list_scroll = sel_row - vis_rows + 1;
+            if (a->list_scroll < 0) a->list_scroll = 0;
+            if (total_rows > vis_rows && a->list_scroll > total_rows - vis_rows) a->list_scroll = total_rows - vis_rows;
+        } else {
+            int rows = (list_h(a) - a->row_h) / a->row_h; if (rows < 1) rows = 1;
+            if (sym == XK_Up) idx -= 1;
+            else if (sym == XK_Down) idx += 1;
+            else if (sym == XK_Left || sym == XK_Right) { /* no-op in list */ }
+            else if (sym == XK_Home) idx = 0;
+            else if (sym == XK_End) idx = a->entry_count - 1;
+            else if (sym == XK_Page_Up) idx -= rows;
+            else if (sym == XK_Page_Down) idx += rows;
+            if (idx < 0) idx = 0;
+            if (idx >= a->entry_count) idx = a->entry_count - 1;
+            select_only(a, idx);
+            if (a->list_sel < a->list_scroll) a->list_scroll = a->list_sel;
+            if (a->list_sel >= a->list_scroll + rows) a->list_scroll = a->list_sel - rows + 1;
+            int max_scroll = a->entry_count > rows ? a->entry_count - rows : 0;
+            if (a->list_scroll > max_scroll) a->list_scroll = max_scroll;
+            if (a->list_scroll < 0) a->list_scroll = 0;
+        }
+        break;
+    }
+    case XK_Return:
+        if (a->list_sel >= 0) open_entry(a, a->list_sel);
+        break;
+    case XK_Delete:
+        if (a->list_sel >= 0 || selected_count(a) > 0) {
+            if (ev->state & ShiftMask) perform_menu(a, MENU_DELETE);
+            else perform_menu(a, MENU_TRASH);
+        }
+        break;
+    case XK_F2:
+        if (a->list_sel >= 0)
+            rename_start(a, a->list_sel);
+        break;
+    case XK_F5:
+        refresh_sidebar(a);
+        refresh_listing(a);
+        break;
+    case XK_Escape:
+        clear_selection(a);
+        a->list_sel = -1;
+        break;
+    case XK_BackSpace:
+        nav_up(a); break;
+    case XK_Alt_L: case XK_Alt_R:
+        break;
+    }
+
+    /* Alt+Left / Right / Up */
+    if (ev->state & Mod1Mask) {
+        if (sym == XK_Left)  nav_back(a);
+        if (sym == XK_Right) nav_forward(a);
+        if (sym == XK_Up)    nav_up(a);
+    }
+
+    draw_app(a);
 }
 
-static void on_mount_unmounted(GObject *source, GAsyncResult *result,
-                               gpointer data) {
-    App *app = data;
-    GError *error = NULL;
-    if (!g_mount_unmount_with_operation_finish(G_MOUNT(source), result,
-                                               &error)) {
-        show_error(app, "Could not unmount this device.", error);
-        g_clear_error(&error);
+static void handle_button_press(App *a, XButtonEvent *ev) {
+    int x = ev->x, y = ev->y;
+
+    if (a->rename_active && ev->button == Button1) {
+        /* clicking commits rename; if click is on another item, selection handled after */
+        rename_commit(a);
+    }
+
+    /* close overlays on click outside */
+    if (a->err_open) {
+        a->err_open = 0; draw_app(a); return;
+    }
+    if (a->props_open) {
+        a->props_open = 0;
+        if (a->props_file) { g_object_unref(a->props_file); a->props_file = NULL; }
+        draw_app(a); return;
+    }
+    if (a->dialog_open) {
+        /* check OK/Cancel buttons */
+        int dw = 480, dh = 160;
+        int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+        int ok_x = dx + dw - 70 - PAD, ok_y = dy + dh - BTN_H - PAD;
+        int can_x = ok_x - 70, can_y = ok_y;
+        if (x >= ok_x && x < ok_x+64 && y >= ok_y && y < ok_y+BTN_H) {
+            if (a->dialog_len > 0 && a->dialog_ok) a->dialog_ok(a);
+            a->dialog_open = 0;
+        } else if (x >= can_x && x < can_x+64 && y >= can_y && y < can_y+BTN_H) {
+            a->dialog_open = 0;
+        }
+        draw_app(a); return;
+    }
+    if (a->picker_open) {
+        int dw = a->win_w * 2 / 3; if (dw < 420) dw = 420; if (dw > a->win_w - 40) dw = a->win_w - 40;
+        int dh = a->win_h * 2 / 3; if (dh < 300) dh = 300; if (dh > a->win_h - 40) dh = a->win_h - 40;
+        int dx = (a->win_w - dw) / 2, dy = (a->win_h - dh) / 2;
+        int by = dy + dh - BTN_H - PAD;
+        int lx = dx + PAD, ly = dy + 52;
+        int lw = dw - 2*PAD, lh = by - ly - PAD;
+        int rows = lh / a->row_h; if (rows < 1) rows = 1;
+
+        /* mouse wheel scroll for picker list */
+        if (ev->button == Button4) {
+            if (a->picker_scroll > 0) a->picker_scroll--;
+            draw_app(a); return;
+        }
+        if (ev->button == Button5) {
+            int max_scroll = a->picker_count > rows ? a->picker_count - rows : 0;
+            if (a->picker_scroll < max_scroll) a->picker_scroll++;
+            draw_app(a); return;
+        }
+
+        /* buttons */
+        if (ev->button == Button1 && y >= by && y < by + BTN_H) {
+            if (x >= dx + dw - PAD - 90 && x < dx + dw - PAD) { picker_select_current(a); draw_app(a); return; }
+            if (x >= dx + dw - PAD - 90 - 58 && x < dx + dw - PAD - 90) {
+                if (a->picker_dir) { GFile *p = g_file_get_parent(a->picker_dir); if (p) { picker_refresh(a, p); g_object_unref(p); } }
+                draw_app(a); return;
+            }
+            if (x >= dx + dw - PAD - 90 - 58 - 64 && x < dx + dw - PAD - 90 - 58) {
+                GFile *h = get_home_file(); picker_refresh(a, h); g_object_unref(h);
+                draw_app(a); return;
+            }
+            if (x >= dx + PAD && x < dx + PAD + 64) { close_picker(a); draw_app(a); return; }
+        }
+        /* list click/double-click */
+        if (ev->button == Button1 && x >= lx && x < lx + lw && y >= ly && y < ly + lh) {
+            int row = (y - ly) / a->row_h + a->picker_scroll;
+            if (row >= 0 && row < a->picker_count) {
+                a->picker_sel = row;
+                /* double click to enter */
+                static Time last_t = 0; static int last_r = -1;
+                int dbl = (row == last_r && ev->time - last_t < 400);
+                last_t = ev->time; last_r = row;
+                if (dbl) picker_refresh(a, a->picker_files[row]);
+            }
+        }
+        draw_app(a); return;
+    }
+
+    /* context menu click */
+    if (a->menu_open) {
+        int count = g_menu_count;
+        int mw = 240, mh = count * a->row_h + 4;
+        int mx = a->menu_x, my = a->menu_y;
+        if (mx + mw > a->win_w) mx = a->win_w - mw;
+        if (my + mh > a->win_h) my = a->win_h - mh;
+
+        a->menu_open = 0;
+        if (x >= mx && x < mx + mw && y >= my && y < my + mh) {
+            int row = (y - my - 2) / a->row_h;
+            if (row >= 0 && row < count && g_menu_items[row].id != MENU_NONE)
+                perform_menu(a, g_menu_items[row].id);
+        }
+        draw_app(a); return;
+    }
+
+    /* scroll wheel */
+    if (ev->button == Button4) {
+        if (ev->state & ControlMask) {
+            apply_zoom(a, +1);
+        } else if (x < a->side_w) {
+            if (a->side_scroll > 0) a->side_scroll--;
+        } else if (a->list_scroll > 0) {
+            a->list_scroll--;
+        }
+        draw_app(a); return;
+    }
+    if (ev->button == Button5) {
+        if (ev->state & ControlMask) {
+            apply_zoom(a, -1);
+        } else if (x < a->side_w) {
+            int rows = list_h(a) / a->row_h;
+            if (a->side_scroll + rows < a->side_count) a->side_scroll++;
+        } else {
+            if (a->icon_mode) {
+                int cols, cw, ch;
+                icon_grid(a, &cols, &cw, &ch);
+                int vis_rows = list_h(a) / ch; if (vis_rows < 1) vis_rows = 1;
+                int total_rows = (a->entry_count + cols - 1) / cols;
+                if (a->list_scroll + vis_rows < total_rows) a->list_scroll++;
+            } else {
+                int rows = (list_h(a) - a->row_h) / a->row_h;
+                if (a->list_scroll + rows < a->entry_count) a->list_scroll++;
+            }
+        }
+        draw_app(a); return;
+    }
+
+    /* splitter drag start */
+    if (abs(x - a->side_w - 1) <= 3 && y >= list_y()) {
+        a->split_drag = 1;
+        a->split_drag_x0 = x;
+        a->split_side_w0 = a->side_w;
         return;
     }
-    refresh_sidebar(app);
+
+    /* address bar focus (top path input) */
+    {
+        int y0 = bar_y() + (BAR_H - BTN_H) / 2;
+        int ax = PAD + 28*3 + PAD; /* after back/forward/up icon buttons */
+        int go_w = 28;
+        int addr_w = a->win_w - ax - go_w - PAD*2;
+        if (addr_w < 60) addr_w = 60;
+        if (y >= y0 && y < y0 + BTN_H && x >= ax && x < ax + addr_w) {
+            a->address_focused = 1;
+            a->search_focused  = 0;
+            a->caret_on = 1; a->caret_tick = 0;
+            a->dnd_press = 0; a->dnd_dragging = 0;
+            draw_app(a); return;
+        }
+    }
+
+    /* search field focus */
+    {
+        int sw_x = a->win_w - 180 - PAD;
+        int sw_y = tool_y() + (TOOL_H - BTN_H) / 2;
+        if (x >= sw_x && x < sw_x + 180 && y >= sw_y && y < sw_y + BTN_H) {
+            a->search_focused  = 1;
+            a->address_focused = 0;
+            a->caret_on = 1; a->caret_tick = 0;
+            a->dnd_press = 0; a->dnd_dragging = 0;
+            draw_app(a); return;
+        }
+    }
+
+    /* toolbar / nav buttons */
+    if (ev->button == Button1) {
+        int btn_id = -99;
+        if (hit_btn(x, y, &btn_id)) {
+            if (btn_id != -1) { a->address_focused = 0; a->search_focused = 0; }
+            switch (btn_id) {
+            case BTN_BACK:     nav_back(a);    break;
+            case BTN_FORWARD:  nav_forward(a); break;
+            case BTN_UP:       nav_up(a);      break;
+            case BTN_GO:       address_commit(a); break;
+            case BTN_HIDDEN:
+                a->show_hidden = !a->show_hidden;
+                refresh_listing(a); break;
+            case BTN_NEWFOLDER:
+                start_dialog(a, "New Folder", "Folder name:", cb_newdir_ok); break;
+            case BTN_NEWFILE:
+                start_dialog(a, "New File", "File name:", cb_newfile_ok); break;
+            case BTN_BM_ADD:
+                if (a->location && a->bookmark_count < MAX_BOOKMARKS) {
+                    a->bookmarks[a->bookmark_count++] = g_object_ref(a->location);
+                    refresh_sidebar(a); save_config(a);
+                }
+                break;
+            case BTN_BM_REM:
+                if (a->location) {
+                    for (int i = 0; i < a->bookmark_count; i++) {
+                        if (g_file_equal(a->bookmarks[i], a->location)) {
+                            g_object_unref(a->bookmarks[i]);
+                            memmove(&a->bookmarks[i], &a->bookmarks[i+1],
+                                    (a->bookmark_count - i - 1) * sizeof(GFile*));
+                            a->bookmark_count--;
+                            refresh_sidebar(a); save_config(a);
+                            break;
+                        }
+                    }
+                }
+                break;
+            case BTN_VIEW_LIST:
+                a->icon_mode = 0; a->list_scroll = 0; break;
+            case BTN_VIEW_ICONS:
+                a->icon_mode = 1; a->icon_zoom = 0; a->list_scroll = 0; clear_entry_thumbs(a); break;
+            case BTN_VIEW_LARGE:
+                a->icon_mode = 1; a->icon_zoom = 4; a->list_scroll = 0; clear_entry_thumbs(a); break;
+            }
+            draw_app(a); return;
+        }
+    }
+
+    /* sidebar click */
+    int sr = side_row_at(a, x, y);
+    if (sr >= 0) {
+        SideEntry *s = &a->side[sr];
+        a->side_sel = sr;
+        if (s->expandable) {
+            if (s->kind == ST_PLACES_GROUP) a->places_expanded = !a->places_expanded;
+            else if (s->kind == ST_BM_GROUP) a->bm_expanded = !a->bm_expanded;
+            else if (s->kind == ST_RECENT_GROUP) a->recent_expanded = !a->recent_expanded;
+            else if (s->kind == ST_DEV_GROUP) a->dev_expanded = !a->dev_expanded;
+            refresh_sidebar(a);
+        } else if (s->kind != ST_BM_GROUP && s->kind != ST_RECENT_GROUP &&
+                   s->kind != ST_PLACES_GROUP && s->kind != ST_DEV_GROUP) {
+            if (s->file) {
+                go_to(a, s->file, 1);
+            } else if (s->volume && g_volume_can_mount(s->volume)) {
+                g_volume_mount(s->volume, G_MOUNT_MOUNT_NONE, NULL, NULL,
+                               on_volume_mounted, a);
+            }
+        }
+        /* right-click on volume: unmount */
+        if (ev->button == Button3 && s->mount) {
+            g_mount_unmount_with_operation(s->mount, G_MOUNT_UNMOUNT_NONE,
+                                           NULL, NULL, on_mount_unmounted, a);
+        }
+        draw_app(a); return;
+    }
+
+    /* list area click */
+    if (x > a->side_w && y > list_y()) {
+        int row = item_at(a, x, y);
+        if (ev->button == Button1) {
+            a->band_active = 0;
+            a->band_press = 0;
+            if (row >= 0) {
+                if (ev->state & ShiftMask) {
+                    int anchor = a->sel_anchor >= 0 ? a->sel_anchor : (a->list_sel >= 0 ? a->list_sel : row);
+                    select_range(a, anchor, row);
+                    a->sel_anchor = anchor;
+                    a->dnd_press = 0;
+                    a->dnd_dragging = 0;
+                    a->dnd_index = row;
+                } else if (ev->state & ControlMask) {
+                    /* Ctrl+click toggles selection; still allow drag if item ends up selected */
+                    if (!a->entries[row].selected) {
+                        toggle_selection(a, row);
+                    } else {
+                        a->list_sel = row;
+                    }
+                    a->sel_anchor = row;
+                    a->dnd_press = 1;
+                    a->dnd_dragging = 0;
+                    a->dnd_start_x = x;
+                    a->dnd_start_y = y;
+                    a->dnd_cur_x = x;
+                    a->dnd_cur_y = y;
+                    a->dnd_index = row;
+                    a->dnd_target_side = -1;
+                    a->dnd_target_item = -1;
+                } else {
+                    if (!a->entries[row].selected) select_only(a, row);
+                    else { a->list_sel = row; a->sel_anchor = row; }
+                    /* potential drag start */
+                    a->dnd_press = 1;
+                    a->dnd_dragging = 0;
+                    a->dnd_start_x = x;
+                    a->dnd_start_y = y;
+                    a->dnd_cur_x = x;
+                    a->dnd_cur_y = y;
+                    a->dnd_index = row;
+                    a->dnd_target_side = -1;
+                    a->dnd_target_item = -1;
+                }
+                a->address_focused = 0;
+                a->search_focused  = 0;
+            } else {
+                if (!(ev->state & ControlMask)) {
+                    clear_selection(a);
+                    a->list_sel = -1;
+                    a->sel_anchor = -1;
+                }
+                /* start rubber-band selection on empty area */
+                a->dnd_press = 0;
+                a->dnd_dragging = 0;
+                a->band_press = 1;
+                a->band_active = 0;
+                a->band_x0 = a->band_x1 = x;
+                a->band_y0 = a->band_y1 = y;
+                a->band_additive = (ev->state & ControlMask) ? 1 : 0;
+                a->address_focused = 0;
+                a->search_focused  = 0;
+            }
+        } else if (ev->button == Button3) {
+            a->dnd_press = 0; a->dnd_dragging = 0;
+            a->band_press = 0; a->band_active = 0;
+            if (row >= 0) {
+                if (!(ev->state & ControlMask) && !a->entries[row].selected)
+                    select_only(a, row);
+                else
+                    a->list_sel = row;
+            }
+            a->menu_open = 1;
+            a->menu_x = x;
+            a->menu_y = y;
+            a->menu_on_file = (row >= 0);
+            a->menu_sel = -1;
+            build_context_menu(a);
+        }
+        draw_app(a); return;
+    }
+    draw_app(a);
 }
 
-static void on_mount_ejected(GObject *source, GAsyncResult *result,
-                             gpointer data) {
-    App *app = data;
-    GError *error = NULL;
-    if (!g_mount_eject_with_operation_finish(G_MOUNT(source), result,
-                                             &error)) {
-        show_error(app, "Could not eject this device.", error);
-        g_clear_error(&error);
+static void handle_button_release(App *a, XButtonEvent *ev) {
+    if (ev->button != Button1) {
+        a->split_drag = 0;
         return;
     }
-    refresh_sidebar(app);
-}
 
-static void on_device_menu_action(GtkMenuItem *item, gpointer data) {
-    App *app = data;
-    const gchar *action = g_object_get_data(G_OBJECT(item), "action");
-    GVolume *volume = g_object_get_data(G_OBJECT(item), "volume");
-    GMount *mount = g_object_get_data(G_OBJECT(item), "mount");
-    if (g_str_equal(action, "mount") && volume != NULL) {
-        g_volume_mount(volume, G_MOUNT_MOUNT_NONE, NULL, NULL,
-                       on_volume_mounted, app);
-    } else if (g_str_equal(action, "unmount")) {
-        GMount *target = mount != NULL ? g_object_ref(mount) :
-                         volume != NULL ? g_volume_get_mount(volume) : NULL;
-        if (target != NULL) {
-            g_mount_unmount_with_operation(target, G_MOUNT_UNMOUNT_NONE, NULL,
-                                           NULL, on_mount_unmounted, app);
-            g_object_unref(target);
+    if (a->band_active) {
+        a->band_x1 = ev->x;
+        a->band_y1 = ev->y;
+        apply_band_selection(a);
+    }
+
+    if (a->dnd_dragging) {
+        GFile *dst = NULL;
+        if (a->dnd_target_side >= 0 && a->dnd_target_side < a->side_count) {
+            SideEntry *s = &a->side[a->dnd_target_side];
+            if (s->file) dst = s->file;
+        } else if (a->dnd_target_item >= 0 && a->dnd_target_item < a->entry_count) {
+            if (a->entries[a->dnd_target_item].ftype == FT_DIR)
+                dst = a->entries[a->dnd_target_item].file;
         }
-    } else if (g_str_equal(action, "eject") && mount != NULL) {
-        g_mount_eject_with_operation(mount, G_MOUNT_UNMOUNT_NONE, NULL, NULL,
-                                     on_mount_ejected, app);
-    }
-}
-
-static void append_device_menu_item(GtkWidget *menu, const gchar *label,
-                                    const gchar *action, GVolume *volume,
-                                    GMount *mount, App *app) {
-    GtkWidget *item = gtk_menu_item_new_with_label(label);
-    g_object_set_data(G_OBJECT(item), "action", (gpointer)action);
-    if (volume != NULL) {
-        g_object_set_data_full(G_OBJECT(item), "volume",
-                               g_object_ref(volume), g_object_unref);
-    }
-    if (mount != NULL) {
-        g_object_set_data_full(G_OBJECT(item), "mount",
-                               g_object_ref(mount), g_object_unref);
-    }
-    g_signal_connect(item, "activate", G_CALLBACK(on_device_menu_action), app);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-}
-
-static gboolean on_sidebar_button_press(GtkWidget *widget,
-                                        GdkEventButton *event,
-                                        gpointer data) {
-    if (event->type != GDK_BUTTON_PRESS ||
-        event->button != GDK_BUTTON_SECONDARY) {
-        return FALSE;
-    }
-    App *app = data;
-    GtkTreePath *path = NULL;
-    if (!gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget), (gint)event->x,
-                                       (gint)event->y, &path, NULL, NULL,
-                                       NULL)) {
-        return FALSE;
-    }
-    GtkTreeIter iter;
-    GVolume *volume = NULL;
-    GMount *mount = NULL;
-    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->sidebar_store), &iter,
-                                 path)) {
-        gtk_tree_path_free(path);
-        return FALSE;
-    }
-    gtk_tree_model_get(GTK_TREE_MODEL(app->sidebar_store), &iter,
-                       SIDE_VOLUME, &volume, SIDE_MOUNT, &mount, -1);
-    gtk_tree_view_set_cursor(GTK_TREE_VIEW(widget), path, NULL, FALSE);
-    gtk_tree_path_free(path);
-    if (volume == NULL && mount == NULL) {
-        return FALSE;
-    }
-    GtkWidget *menu = gtk_menu_new();
-    GMount *actual_mount = mount != NULL ? g_object_ref(mount) :
-                           volume != NULL ? g_volume_get_mount(volume) : NULL;
-    if (actual_mount != NULL) {
-        if (g_mount_can_unmount(actual_mount)) {
-            append_device_menu_item(menu, "Unmount", "unmount", volume,
-                                    actual_mount, app);
-        }
-        if (g_mount_can_eject(actual_mount)) {
-            append_device_menu_item(menu, "Eject", "eject", volume,
-                                    actual_mount, app);
-        }
-        g_object_unref(actual_mount);
-    } else if (volume != NULL && g_volume_can_mount(volume)) {
-        append_device_menu_item(menu, "Mount", "mount", volume, NULL, app);
-    }
-    GList *items = gtk_container_get_children(GTK_CONTAINER(menu));
-    gboolean has_actions = items != NULL;
-    g_list_free(items);
-    if (!has_actions) {
-        gtk_widget_destroy(menu);
-        g_clear_object(&mount);
-        g_clear_object(&volume);
-        return FALSE;
-    }
-    gtk_widget_show_all(menu);
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
-    g_clear_object(&mount);
-    g_clear_object(&volume);
-    return TRUE;
-}
-
-static void on_volume_monitor_changed(GVolumeMonitor *monitor, GObject *object,
-                                      gpointer data) {
-    (void)monitor;
-    (void)object;
-    refresh_sidebar(data);
-}
-
-static void app_activate(GtkApplication *application, gpointer user_data) {
-    App *app = user_data;
-    if (app->window != NULL) {
-        gtk_window_present(GTK_WINDOW(app->window));
-        return;
-    }
-    app->application = application;
-    app->window = gtk_application_window_new(application);
-    gtk_window_set_title(GTK_WINDOW(app->window), "GnuChan File Manager");
-    gtk_window_set_default_size(GTK_WINDOW(app->window), 900, 600);
-
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_container_set_border_width(GTK_CONTAINER(outer), 8);
-    gtk_container_add(GTK_CONTAINER(app->window), outer);
-    GtkWidget *navigation = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), navigation, FALSE, FALSE, 0);
-    app->back_button = add_button(navigation, "←", NULL, app);
-    app->forward_button = add_button(navigation, "→", NULL, app);
-    app->up_button = add_button(navigation, "↑", NULL, app);
-    g_signal_connect(app->back_button, "clicked", G_CALLBACK(on_back), app);
-    g_signal_connect(app->forward_button, "clicked", G_CALLBACK(on_forward), app);
-    g_signal_connect(app->up_button, "clicked", G_CALLBACK(on_up), app);
-    app->address = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->address), "Location");
-    gtk_box_pack_start(GTK_BOX(navigation), app->address, TRUE, TRUE, 0);
-    g_signal_connect(app->address, "activate",
-                     G_CALLBACK(on_address_activate), app);
-    GtkWidget *go_button = add_button(navigation, "Go", NULL, app);
-    g_signal_connect(go_button, "clicked", G_CALLBACK(on_go_clicked), app);
-
-    GtkWidget *tools = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), tools, FALSE, FALSE, 0);
-    app->search = gtk_search_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app->search), "Search this folder");
-    gtk_box_pack_start(GTK_BOX(tools), app->search, TRUE, TRUE, 0);
-    g_signal_connect(app->search, "search-changed",
-                     G_CALLBACK(on_search_changed), app);
-    app->hidden_button = gtk_check_button_new_with_label("Show hidden files");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->hidden_button),
-                                 app->show_hidden);
-    gtk_box_pack_start(GTK_BOX(tools), app->hidden_button, FALSE, FALSE, 0);
-    g_signal_connect(app->hidden_button, "toggled",
-                     G_CALLBACK(on_hidden_toggled), app);
-    GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), actions, FALSE, FALSE, 0);
-    GtkWidget *new_folder = add_button(actions, "New Folder…", NULL, app);
-    GtkWidget *new_file = add_button(actions, "New File…", NULL, app);
-    g_signal_connect(new_folder, "clicked",
-                     G_CALLBACK(on_new_folder_clicked), app);
-    g_signal_connect(new_file, "clicked",
-                     G_CALLBACK(on_new_file_clicked), app);
-    GtkWidget *list_button = add_button(actions, "List", NULL, app);
-    GtkWidget *icons_button = add_button(actions, "Icons", NULL, app);
-    g_signal_connect(list_button, "clicked", G_CALLBACK(on_list_view_clicked),
-                     app);
-    g_signal_connect(icons_button, "clicked",
-                     G_CALLBACK(on_icon_view_clicked), app);
-    GtkWidget *bookmark_button = add_button(actions, "Bookmark Location",
-                                            NULL, app);
-    g_object_set_data(G_OBJECT(bookmark_button), "bookmark-action", "add");
-    g_signal_connect(bookmark_button, "clicked",
-                     G_CALLBACK(on_bookmark_clicked), app);
-    GtkWidget *remove_bookmark_button = add_button(
-        actions, "Remove Bookmark", NULL, app);
-    g_object_set_data(G_OBJECT(remove_bookmark_button), "bookmark-action",
-                      "remove");
-    g_signal_connect(remove_bookmark_button, "clicked",
-                     G_CALLBACK(on_bookmark_clicked), app);
-
-    app->store = gtk_list_store_new(N_COLUMNS, G_TYPE_STRING, G_TYPE_STRING,
-                                    G_TYPE_STRING, G_TYPE_FILE,
-                                    GDK_TYPE_PIXBUF);
-    app->view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app->store));
-    add_name_column(GTK_TREE_VIEW(app->view));
-    add_text_column(GTK_TREE_VIEW(app->view), "Type", COL_TYPE, FALSE);
-    add_text_column(GTK_TREE_VIEW(app->view), "Size", COL_SIZE, FALSE);
-    gtk_tree_view_set_headers_clickable(GTK_TREE_VIEW(app->view), TRUE);
-    gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(app->view), FALSE);
-    GtkTreeViewColumn *name_column =
-        gtk_tree_view_get_column(GTK_TREE_VIEW(app->view), 0);
-    gtk_tree_view_column_set_sort_column_id(name_column, COL_NAME);
-    gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(app->store),
-                                         COL_NAME, GTK_SORT_ASCENDING);
-    g_signal_connect(app->view, "row-activated",
-                     G_CALLBACK(on_row_activated), app);
-
-    app->sidebar_store = gtk_tree_store_new(
-        N_SIDE_COLUMNS, G_TYPE_STRING, G_TYPE_FILE, G_TYPE_VOLUME, G_TYPE_MOUNT,
-        G_TYPE_BOOLEAN);
-    app->sidebar = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(app->sidebar_store));
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(app->sidebar), FALSE);
-    add_text_column(GTK_TREE_VIEW(app->sidebar), "Places", SIDE_NAME, TRUE);
-    g_signal_connect(app->sidebar, "row-expanded",
-                     G_CALLBACK(on_sidebar_row_expanded), app);
-    g_signal_connect(app->sidebar, "row-activated",
-                     G_CALLBACK(on_sidebar_row_activated), app);
-    g_signal_connect(app->sidebar, "button-press-event",
-                     G_CALLBACK(on_sidebar_button_press), app);
-
-    GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_container_add(GTK_CONTAINER(sidebar_scroll), app->sidebar);
-    gtk_widget_set_size_request(sidebar_scroll, 190, -1);
-    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_box_pack_start(GTK_BOX(outer), paned, TRUE, TRUE, 0);
-    gtk_paned_pack1(GTK_PANED(paned), sidebar_scroll, FALSE, FALSE);
-
-    app->icon_view = gtk_icon_view_new_with_model(GTK_TREE_MODEL(app->store));
-    gtk_widget_set_name(app->icon_view, "file-icon-view");
-    gtk_icon_view_set_text_column(GTK_ICON_VIEW(app->icon_view), COL_NAME);
-    gtk_icon_view_set_pixbuf_column(GTK_ICON_VIEW(app->icon_view), COL_PREVIEW);
-    gtk_icon_view_set_item_width(GTK_ICON_VIEW(app->icon_view), 100);
-    gtk_icon_view_set_activate_on_single_click(GTK_ICON_VIEW(app->icon_view),
-                                               FALSE);
-    g_signal_connect(app->icon_view, "item-activated",
-                     G_CALLBACK(on_icon_item_activated), app);
-    app->view_stack = gtk_stack_new();
-    gtk_stack_set_transition_type(GTK_STACK(app->view_stack),
-                                  GTK_STACK_TRANSITION_TYPE_CROSSFADE);
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_container_add(GTK_CONTAINER(scroll), app->view);
-    GtkWidget *icon_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(icon_scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_container_add(GTK_CONTAINER(icon_scroll), app->icon_view);
-    gtk_stack_add_named(GTK_STACK(app->view_stack), scroll, "list");
-    gtk_stack_add_named(GTK_STACK(app->view_stack), icon_scroll, "icons");
-    gtk_stack_set_visible_child_name(GTK_STACK(app->view_stack),
-                                     app->icon_mode ? "icons" : "list");
-    gtk_paned_pack2(GTK_PANED(paned), app->view_stack, TRUE, FALSE);
-    g_signal_connect(app->view, "button-press-event",
-                     G_CALLBACK(on_file_button_press), app);
-    g_signal_connect(app->icon_view, "button-press-event",
-                     G_CALLBACK(on_file_button_press), app);
-    g_signal_connect(app->window, "key-press-event",
-                     G_CALLBACK(on_window_key_press), app);
-
-    app->volume_monitor = g_volume_monitor_get();
-    app->volume_added_handler = g_signal_connect(
-        app->volume_monitor, "volume-added",
-        G_CALLBACK(on_volume_monitor_changed), app);
-    app->volume_removed_handler = g_signal_connect(
-        app->volume_monitor, "volume-removed",
-        G_CALLBACK(on_volume_monitor_changed), app);
-    app->mount_added_handler = g_signal_connect(
-        app->volume_monitor, "mount-added",
-        G_CALLBACK(on_volume_monitor_changed), app);
-    app->mount_removed_handler = g_signal_connect(
-        app->volume_monitor, "mount-removed",
-        G_CALLBACK(on_volume_monitor_changed), app);
-    refresh_sidebar(app);
-    gtk_widget_show_all(app->window);
-    GtkTreePath *home_path = gtk_tree_path_new_from_indices(0, -1);
-    gtk_tree_view_expand_row(GTK_TREE_VIEW(app->sidebar), home_path, FALSE);
-    gtk_tree_path_free(home_path);
-
-    GFile *start = app->history->len != 0
-                       ? g_object_ref(g_ptr_array_index(app->history, 0))
-                       : file_from_address(app->start_location, NULL);
-    if (app->history->len == 0) {
-        g_ptr_array_add(app->history, g_object_ref(start));
-    }
-    if (!go_to(app, start, FALSE) && app->history->len == 1) {
-        g_ptr_array_set_size(app->history, 0);
-        g_clear_object(&start);
-        start = g_file_new_for_path(g_get_home_dir());
-        g_ptr_array_add(app->history, g_object_ref(start));
-        go_to(app, start, FALSE);
-    }
-    g_object_unref(start);
-}
-
-static void app_free(App *app) {
-    g_mutex_lock(&app->copy_mutex);
-    app->shutting_down = TRUE;
-    if (app->copy_cancellable != NULL) {
-        g_cancellable_cancel(app->copy_cancellable);
-    }
-    g_cond_broadcast(&app->copy_condition);
-    g_mutex_unlock(&app->copy_mutex);
-    if (app->copy_thread != NULL) {
-        g_thread_join(app->copy_thread);
-    }
-    if (app->copy_timer != 0) {
-        g_source_remove(app->copy_timer);
-    }
-    if (app->copy_queue != NULL) {
-        g_queue_free_full(app->copy_queue, copy_job_free);
-    }
-    if (app->volume_monitor != NULL) {
-        if (app->volume_added_handler != 0) {
-            g_signal_handler_disconnect(app->volume_monitor,
-                                        app->volume_added_handler);
-        }
-        if (app->volume_removed_handler != 0) {
-            g_signal_handler_disconnect(app->volume_monitor,
-                                        app->volume_removed_handler);
-        }
-        if (app->mount_added_handler != 0) {
-            g_signal_handler_disconnect(app->volume_monitor,
-                                        app->mount_added_handler);
-        }
-        if (app->mount_removed_handler != 0) {
-            g_signal_handler_disconnect(app->volume_monitor,
-                                        app->mount_removed_handler);
+        if (dst) {
+            int is_move = !(ev->state & ControlMask);
+            int count = selected_count(a);
+            if (count > 0) {
+                for (int i = 0; i < a->entry_count; i++)
+                    if (a->entries[i].selected)
+                        queue_copy(a, a->entries[i].file, dst, is_move);
+            } else if (a->dnd_index >= 0 && a->dnd_index < a->entry_count) {
+                queue_copy(a, a->entries[a->dnd_index].file, dst, is_move);
+            }
+            if (a->xdnd_target != None) {
+                xdnd_send(a, a->xdnd_target, a->xdnd_leave, 0,0,0,0);
+                a->xdnd_target = None;
+            }
+        } else if (a->xdnd_target != None) {
+            /* external drop */
+            xdnd_send(a, a->xdnd_target, a->xdnd_drop, 0, ev->time, 0, 0);
+            XFlush(a->dpy);
+            a->xdnd_target = None;
         }
     }
-    g_clear_object(&app->location);
-    g_clear_object(&app->store);
-    g_clear_object(&app->sidebar_store);
-    g_clear_object(&app->volume_monitor);
-    if (app->history != NULL) {
-        g_ptr_array_unref(app->history);
+
+    hide_drag_icon(a);
+    if (a->band_active || a->band_press || a->dnd_dragging || a->dnd_press) {
+        XUngrabPointer(a->dpy, CurrentTime);
     }
-    if (app->bookmarks != NULL) {
-        g_ptr_array_unref(app->bookmarks);
-    }
-    if (app->recent_locations != NULL) {
-        g_ptr_array_unref(app->recent_locations);
-    }
-    g_free(app->config_path);
-    g_free(app->start_location);
-    g_free(app->copy_current_path);
-    g_free(app->copy_error);
-    g_clear_object(&app->copy_cancellable);
-    g_cond_clear(&app->copy_condition);
-    g_mutex_clear(&app->copy_mutex);
+    XUndefineCursor(a->dpy, a->win);
+
+    a->band_active = 0;
+    a->band_press = 0;
+    a->dnd_dragging = 0;
+    a->dnd_press = 0;
+    a->dnd_target_side = -1;
+    a->dnd_target_item = -1;
+    a->split_drag = 0;
+    draw_app(a);
 }
 
-static void app_open(GApplication *application, GFile **files, gint count,
-                     const gchar *hint, gpointer user_data) {
-    (void)hint;
-    App *app = user_data;
-    if (app->window == NULL) {
-        app_activate(GTK_APPLICATION(application), app);
+static void xdnd_send(App *a, Window target, Atom msg, long d1, long d2, long d3, long d4) {
+    XClientMessageEvent cm = {0};
+    cm.type = ClientMessage;
+    cm.window = target;
+    cm.message_type = msg;
+    cm.format = 32;
+    cm.data.l[0] = (long)a->win;
+    cm.data.l[1] = d1; cm.data.l[2] = d2; cm.data.l[3] = d3; cm.data.l[4] = d4;
+    XSendEvent(a->dpy, target, False, NoEventMask, (XEvent *)&cm);
+}
+
+static Window xdnd_find_target(App *a, int root_x, int root_y, int *ver_out) {
+    Window root_ret, child_ret, target = None;
+    int rx, ry, wx, wy;
+    unsigned int mask;
+    Window root = DefaultRootWindow(a->dpy);
+    Window w = root;
+    int x = root_x, y = root_y;
+    /* descend to leaf window under pointer */
+    while (XQueryPointer(a->dpy, w, &root_ret, &child_ret, &rx, &ry, &wx, &wy, &mask) && child_ret != None) {
+        if (child_ret == a->win) { *ver_out = 0; return None; }
+        w = child_ret; x = wx; y = wy;
     }
+    if (w == root || w == a->win) { *ver_out = 0; return None; }
+    /* walk up to find XdndAware window */
+    target = w;
+    while (target != None && target != root) {
+        Atom actual_type; int actual_format; unsigned long nitems, bytes_after; unsigned char *data = NULL;
+        if (XGetWindowProperty(a->dpy, target, a->xdnd_aware, 0, 1, False, AnyPropertyType,
+                               &actual_type, &actual_format, &nitems, &bytes_after, &data) == Success && data) {
+            int ver = *(long *)data; /* XdndAware is ATOM/32 often read as long */
+            XFree(data);
+            if (ver >= 3) { *ver_out = ver; return target; }
+        }
+        if (data) XFree(data);
+        Window parent, *children = NULL; unsigned int nchild = 0;
+        if (!XQueryTree(a->dpy, target, &root_ret, &parent, &children, &nchild)) break;
+        if (children) XFree(children);
+        target = parent;
+    }
+    *ver_out = 0; (void)x; (void)y;
+    return None;
+}
+
+static void build_xdnd_data(App *a) {
+    free(a->xdnd_data);
+    GString *gs = g_string_new(NULL);
+    int count = selected_count(a);
     if (count > 0) {
-        GError *error = NULL;
-        GFileInfo *info = g_file_query_info(
-            files[0], G_FILE_ATTRIBUTE_STANDARD_TYPE, G_FILE_QUERY_INFO_NONE,
-            NULL, &error);
-        if (info != NULL &&
-            g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
-            go_to(app, files[0], TRUE);
-        } else if (info != NULL) {
-            gchar *uri = g_file_get_uri(files[0]);
-            g_app_info_launch_default_for_uri(uri, NULL, &error);
-            g_free(uri);
+        for (int i = 0; i < a->entry_count; i++) {
+            if (!a->entries[i].selected) continue;
+            char *uri = g_file_get_uri(a->entries[i].file);
+            g_string_append(gs, uri); g_string_append(gs, "\r\n"); g_free(uri);
         }
-        if (error != NULL) {
-            show_error(app, "Could not open the requested item.", error);
-            g_clear_error(&error);
-        }
-        g_clear_object(&info);
+    } else if (a->dnd_index >= 0 && a->dnd_index < a->entry_count) {
+        char *uri = g_file_get_uri(a->entries[a->dnd_index].file);
+        g_string_append(gs, uri); g_string_append(gs, "\r\n"); g_free(uri);
+    }
+    a->xdnd_data = g_string_free(gs, FALSE);
+}
+
+static void drag_icon_label(App *a, char *out, size_t outsz) {
+    int count = selected_count(a);
+    if (count > 1) snprintf(out, outsz, "%d items", count);
+    else if (a->dnd_index >= 0 && a->dnd_index < a->entry_count)
+        snprintf(out, outsz, "%s", a->entries[a->dnd_index].name);
+    else snprintf(out, outsz, "Dragging");
+}
+
+static void show_drag_icon(App *a, int root_x, int root_y) {
+    char label[256];
+    drag_icon_label(a, label, sizeof(label));
+    int pad = 8;
+    int tw = text_w(a, a->font, label);
+    int w = tw + pad * 2;
+    int h = a->row_h + 4;
+    if (w < 40) w = 40;
+    if (h < 20) h = 20;
+
+    if (!a->drag_icon) {
+        XSetWindowAttributes wa;
+        memset(&wa, 0, sizeof(wa));
+        wa.override_redirect = True;
+        wa.background_pixel = a->panel.pixel;
+        wa.border_pixel = a->accent.pixel;
+        wa.event_mask = ExposureMask;
+        a->drag_icon = XCreateWindow(a->dpy, RootWindow(a->dpy, a->scr),
+                                     root_x + 16, root_y + 16,
+                                     (unsigned)w, (unsigned)h, 1,
+                                     CopyFromParent, InputOutput, CopyFromParent,
+                                     CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+                                     &wa);
+        a->drag_icon_draw = XftDrawCreate(a->dpy, a->drag_icon,
+                                          DefaultVisual(a->dpy, a->scr),
+                                          DefaultColormap(a->dpy, a->scr));
+    } else {
+        XResizeWindow(a->dpy, a->drag_icon, (unsigned)w, (unsigned)h);
+    }
+    a->drag_icon_w = w;
+    a->drag_icon_h = h;
+
+    XMoveWindow(a->dpy, a->drag_icon, root_x + 16, root_y + 16);
+    XMapRaised(a->dpy, a->drag_icon);
+
+    XSetForeground(a->dpy, a->gc, a->panel.pixel);
+    XFillRectangle(a->dpy, a->drag_icon, a->gc, 0, 0, (unsigned)w, (unsigned)h);
+    XSetForeground(a->dpy, a->gc, a->accent.pixel);
+    XDrawRectangle(a->dpy, a->drag_icon, a->gc, 0, 0, (unsigned)(w - 1), (unsigned)(h - 1));
+    if (a->drag_icon_draw) {
+        int baseline = (h + a->font->ascent - a->font->descent) / 2;
+        XftDrawStringUtf8(a->drag_icon_draw, &a->text, a->font, pad, baseline,
+                          (const FcChar8 *)label, (int)strlen(label));
+    }
+    XFlush(a->dpy);
+}
+
+static void move_drag_icon(App *a, int root_x, int root_y) {
+    if (!a->drag_icon) return;
+    XMoveWindow(a->dpy, a->drag_icon, root_x + 16, root_y + 16);
+    XFlush(a->dpy);
+}
+
+static void hide_drag_icon(App *a) {
+    if (a->drag_icon) {
+        XUnmapWindow(a->dpy, a->drag_icon);
+        XFlush(a->dpy);
     }
 }
 
-int main(int argc, char **argv) {
-    App app = {0};
-    g_mutex_init(&app.copy_mutex);
-    g_cond_init(&app.copy_condition);
-    app.copy_queue = g_queue_new();
-    app.copy_cancellable = g_cancellable_new();
-    app.history = g_ptr_array_new_with_free_func(g_object_unref);
-    app.bookmarks = g_ptr_array_new_with_free_func(g_object_unref);
-    app.recent_locations = g_ptr_array_new_with_free_func(g_object_unref);
-    gchar *config_dir = g_build_filename(g_get_user_config_dir(),
-                                         "GnuChanFileManager", NULL);
-    app.config_path = g_build_filename(config_dir, "config.conf", NULL);
-    g_free(config_dir);
-    GKeyFile *key_file = g_key_file_new();
-    if (g_key_file_load_from_file(key_file, app.config_path,
-                                  G_KEY_FILE_NONE, NULL)) {
-        app.show_hidden = g_key_file_get_boolean(key_file, "General",
-                                                 "show_hidden", NULL);
-        app.icon_mode = g_key_file_get_boolean(key_file, "General",
-                                               "icon_mode", NULL);
-        app.start_location = g_key_file_get_string(
-            key_file, "General", "start_location", NULL);
-        load_file_list(key_file, "bookmarks", app.bookmarks, 50);
-        load_file_list(key_file, "recent_locations",
-                       app.recent_locations, 10);
+static void xdnd_update_target(App *a, int root_x, int root_y) {
+    int ver = 0;
+    Window target = xdnd_find_target(a, root_x, root_y, &ver);
+    if (target != a->xdnd_target) {
+        if (a->xdnd_target != None) {
+            xdnd_send(a, a->xdnd_target, a->xdnd_leave, 0, 0, 0, 0);
+        }
+        a->xdnd_target = target;
+        a->xdnd_version = ver;
+        if (target != None) {
+            Atom tlist[3] = { a->atom_uri_list, a->atom_utf8, a->atom_gnome_files };
+            XChangeProperty(a->dpy, a->win, a->xdnd_type_list, XA_ATOM, 32,
+                            PropModeReplace, (unsigned char *)tlist, 3);
+            XSetSelectionOwner(a->dpy, a->xdnd_selection, a->win, CurrentTime);
+            long d1 = ((long)(ver > 5 ? 5 : ver) << 24) | 1L; /* >3 types, see XdndTypeList */
+            xdnd_send(a, target, a->xdnd_enter, d1, (long)a->atom_uri_list, (long)a->atom_utf8, (long)a->atom_gnome_files);
+        }
     }
-    g_key_file_unref(key_file);
-    if (app.start_location == NULL) {
-        app.start_location = g_strdup("~");
+    if (a->xdnd_target != None) {
+        long pos = ((long)root_x << 16) | ((long)root_y & 0xffff);
+        xdnd_send(a, a->xdnd_target, a->xdnd_position, 0, pos, CurrentTime, (long)a->xdnd_action_copy);
+    }
+}
+
+static int rects_intersect(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    if (aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0) return 0;
+    return !(ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay);
+}
+
+static int item_rect(App *a, int i, int *rx, int *ry, int *rw, int *rh) {
+    if (i < 0 || i >= a->entry_count) return 0;
+    if (a->icon_mode) {
+        int cols, cell_w, cell_h;
+        icon_grid(a, &cols, &cell_w, &cell_h);
+        int grid_w = cols * cell_w;
+        int xoff = (list_w(a) - grid_w) / 2;
+        if (xoff < 0) xoff = 0;
+        int vis_start = a->list_scroll * cols;
+        if (i < vis_start) return 0;
+        int idx = i - vis_start;
+        int col = idx % cols;
+        int row = idx / cols;
+        int vis_rows = list_h(a) / cell_h;
+        if (row >= vis_rows + 1) return 0;
+        *rx = list_x(a) + xoff + col * cell_w + 4;
+        *ry = list_y() + row * cell_h + 4;
+        *rw = cell_w - 8;
+        *rh = cell_h - 8;
+        return 1;
+    } else {
+        int start = a->list_scroll;
+        int rows = (list_h(a) - a->row_h) / a->row_h;
+        if (i < start || i >= start + rows) return 0;
+        int y0 = list_y() + a->row_h + (i - start) * a->row_h;
+        *rx = list_x(a);
+        *ry = y0;
+        *rw = list_w(a);
+        *rh = a->row_h;
+        return 1;
+    }
+}
+
+static void apply_band_selection(App *a) {
+    int x1 = a->band_x0 < a->band_x1 ? a->band_x0 : a->band_x1;
+    int y1 = a->band_y0 < a->band_y1 ? a->band_y0 : a->band_y1;
+    int x2 = a->band_x0 > a->band_x1 ? a->band_x0 : a->band_x1;
+    int y2 = a->band_y0 > a->band_y1 ? a->band_y0 : a->band_y1;
+    int bw = x2 - x1, bh = y2 - y1;
+    if (!a->band_additive) clear_selection(a);
+    for (int i = 0; i < a->entry_count; i++) {
+        int rx, ry, rw, rh;
+        if (!item_rect(a, i, &rx, &ry, &rw, &rh)) continue;
+        if (rects_intersect(x1, y1, bw, bh, rx, ry, rw, rh))
+            a->entries[i].selected = 1;
+    }
+    if (selected_count(a) == 0) a->list_sel = -1;
+}
+
+static void handle_motion(App *a, XMotionEvent *ev) {
+    if (a->split_drag) {
+        int new_w = a->split_side_w0 + (ev->x - a->split_drag_x0);
+        if (new_w < 80)  new_w = 80;
+        if (new_w > a->win_w / 2) new_w = a->win_w / 2;
+        a->side_w = new_w;
+        draw_app(a); return;
     }
 
-    if (argc == 2 && g_str_equal(argv[1], "--version")) {
-        g_print("GnuChan File Manager %s\n", APP_VERSION);
-        app_free(&app);
+    /* rubber-band selection */
+    if (a->band_press && (ev->state & Button1Mask)) {
+        int dx = ev->x - a->band_x0;
+        int dy = ev->y - a->band_y0;
+        if (!a->band_active && (dx*dx + dy*dy) > 16) {
+            a->band_active = 1;
+            XGrabPointer(a->dpy, a->win, False,
+                         PointerMotionMask | ButtonReleaseMask | ButtonPressMask,
+                         GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+        }
+        if (a->band_active) {
+            a->band_x1 = ev->x;
+            a->band_y1 = ev->y;
+            apply_band_selection(a);
+            draw_app(a);
+            return;
+        }
+    }
+
+    /* internal drag and drop */
+    if (a->dnd_press && (ev->state & Button1Mask)) {
+        a->dnd_cur_x = ev->x;
+        a->dnd_cur_y = ev->y;
+        int dx = ev->x - a->dnd_start_x;
+        int dy = ev->y - a->dnd_start_y;
+        if (!a->dnd_dragging && (dx*dx + dy*dy) > 25) {
+            a->dnd_dragging = 1;
+            a->xdnd_target = None;
+            a->xdnd_version = 0;
+            a->xdnd_last_x = -9999;
+            a->xdnd_last_y = -9999;
+            build_xdnd_data(a);
+            XSetSelectionOwner(a->dpy, a->xdnd_selection, a->win, CurrentTime);
+            if (a->drag_cursor) XDefineCursor(a->dpy, a->win, a->drag_cursor);
+            XGrabPointer(a->dpy, a->win, False,
+                         PointerMotionMask | ButtonReleaseMask | ButtonPressMask,
+                         GrabModeAsync, GrabModeAsync, None, a->drag_cursor, CurrentTime);
+            show_drag_icon(a, ev->x_root, ev->y_root);
+        }
+        if (a->dnd_dragging) {
+            int sr = side_row_at(a, ev->x, ev->y);
+            a->dnd_target_side = -1;
+            a->dnd_target_item = -1;
+            if (sr >= 0) {
+                SideEntry *s = &a->side[sr];
+                if (s->file || s->volume) a->dnd_target_side = sr;
+                if (a->xdnd_target != None) { xdnd_send(a, a->xdnd_target, a->xdnd_leave, 0,0,0,0); a->xdnd_target = None; }
+            } else {
+                int ir = item_at(a, ev->x, ev->y);
+                if (ir >= 0 && ir < a->entry_count && a->entries[ir].ftype == FT_DIR) {
+                    if (!(a->entries[ir].selected)) a->dnd_target_item = ir;
+                }
+                if (a->dnd_target_item < 0) {
+                    /* check for external XDND target (throttled) */
+                    int dxr = ev->x_root - a->xdnd_last_x;
+                    int dyr = ev->y_root - a->xdnd_last_y;
+                    if (dxr*dxr + dyr*dyr > 16 || a->xdnd_target == None) {
+                        a->xdnd_last_x = ev->x_root;
+                        a->xdnd_last_y = ev->y_root;
+                        xdnd_update_target(a, ev->x_root, ev->y_root);
+                    }
+                } else if (a->xdnd_target != None) {
+                    xdnd_send(a, a->xdnd_target, a->xdnd_leave, 0,0,0,0); a->xdnd_target = None;
+                    a->xdnd_last_x = -9999; a->xdnd_last_y = -9999;
+                }
+            }
+            move_drag_icon(a, ev->x_root, ev->y_root);
+            draw_app(a);
+            return;
+        }
+    }
+    /* update menu hover */
+    if (a->menu_open) {
+        int count = g_menu_count;
+        int mw = 240, mh = count * a->row_h + 4;
+        int mx = a->menu_x, my = a->menu_y;
+        if (mx + mw > a->win_w) mx = a->win_w - mw;
+        if (my + mh > a->win_h) my = a->win_h - mh;
+        int old_sel = a->menu_sel;
+        a->menu_sel = -1;
+        if (ev->x >= mx && ev->x < mx + mw &&
+            ev->y >= my && ev->y < my + mh) {
+            int row = (ev->y - my - 2) / a->row_h;
+            if (row >= 0 && row < count && g_menu_items[row].id != MENU_NONE) a->menu_sel = row;
+        }
+        if (a->menu_sel != old_sel) draw_app(a);
+    }
+}
+
+/* double-click detection */
+static Time g_last_click_time = 0;
+static int  g_last_click_row  = -1;
+
+static void handle_click_or_dblclick(App *a, XButtonEvent *ev) {
+    if (ev->button != Button1) return;
+    if (a->menu_open || a->dialog_open || a->err_open || a->props_open) return;
+    if (a->dnd_dragging) return;
+    int row = item_at(a, ev->x, ev->y);
+    if (row < 0) return;
+
+    int is_dbl = (row == g_last_click_row &&
+                  ev->time - g_last_click_time < 400);
+    g_last_click_time = ev->time;
+    g_last_click_row  = row;
+
+    if (is_dbl) {
+        g_last_click_row = -1;
+        open_entry(a, row);
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * GLib main-loop integration via timer fd
+ * ══════════════════════════════════════════════════════════════════*/
+static void pump_glib(void) {
+    GMainContext *ctx = g_main_context_default();
+    while (g_main_context_iteration(ctx, FALSE))
+        ;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════
+ * UI icon loading (toolbar buttons)
+ * ══════════════════════════════════════════════════════════════════*/
+static XImage *load_ui_icon(App *a, const char *path) {
+    GError *err = NULL;
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, &err);
+    if (!pb) { if (err) g_error_free(err); return NULL; }
+    int w = gdk_pixbuf_get_width(pb);
+    int h = gdk_pixbuf_get_height(pb);
+    int stride = gdk_pixbuf_get_rowstride(pb);
+    int nchan = gdk_pixbuf_get_n_channels(pb);
+    int has_alpha = gdk_pixbuf_get_has_alpha(pb);
+    guchar *px = gdk_pixbuf_get_pixels(pb);
+
+    Visual *vis = DefaultVisual(a->dpy, a->scr);
+    int depth = DefaultDepth(a->dpy, a->scr);
+    if (depth < 24) depth = 24;
+    int bpp = 32;
+    int bytes_per_line = w * 4;
+    char *data = calloc(1, (size_t)bytes_per_line * (size_t)h);
+    if (!data) { g_object_unref(pb); return NULL; }
+
+    unsigned long rm = vis->red_mask, gm = vis->green_mask, bm = vis->blue_mask;
+    int rs=0, gs=0, bs=0;
+    if (rm) while (((rm >> rs) & 1UL) == 0UL) rs++;
+    if (gm) while (((gm >> gs) & 1UL) == 0UL) gs++;
+    if (bm) while (((bm >> bs) & 1UL) == 0UL) bs++;
+
+    for (int yy = 0; yy < h; yy++) {
+        guchar *row = px + yy * stride;
+        for (int xx = 0; xx < w; xx++) {
+            guchar r = row[xx * nchan + 0];
+            guchar g = row[xx * nchan + 1];
+            guchar b = row[xx * nchan + 2];
+            guchar alpha = (has_alpha && nchan >= 4) ? row[xx * nchan + 3] : 255;
+            if (alpha < 255) {
+                r = (guchar)((r * alpha + 42 * (255 - alpha)) / 255);
+                g = (guchar)((g * alpha + 34 * (255 - alpha)) / 255);
+                b = (guchar)((b * alpha + 48 * (255 - alpha)) / 255);
+            }
+            unsigned long pixel = ((unsigned long)r << rs) |
+                                  ((unsigned long)g << gs) |
+                                  ((unsigned long)b << bs);
+            memcpy(data + (yy * bytes_per_line + xx * 4), &pixel, 4);
+        }
+    }
+
+    XImage *img = XCreateImage(a->dpy, vis, (unsigned)depth, ZPixmap, 0, data, w, h, bpp, bytes_per_line);
+    g_object_unref(pb);
+    if (!img) { free(data); return NULL; }
+    return img;
+}
+
+static void load_ui_icons(App *a) {
+    for (int i = 0; i < UI_ICON_COUNT; i++) { a->ui_icons[i] = NULL; a->ui_icon_w[i] = 0; a->ui_icon_h[i] = 0; }
+    static const char *names[UI_ICON_COUNT] = {
+        "back","forward","up","go","hidden","new_folder","new_file",
+        "bm_add","bm_remove","view_list","view_icons","view_large"
+    };
+    char exe[PATH_MAX] = {0};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe)-1);
+    if (n > 0) exe[n] = '\0';
+    char exedir[PATH_MAX] = {0};
+    if (exe[0]) { snprintf(exedir, sizeof(exedir), "%s", exe); char *sl = strrchr(exedir,'/'); if (sl) *sl = '\0'; }
+    const char *home = g_get_home_dir();
+    for (int i = 0; i < UI_ICON_COUNT; i++) {
+        char candidates[10][PATH_MAX];
+        int c = 0;
+        if (exedir[0]) snprintf(candidates[c++], PATH_MAX, "%s/src/icons/ui/%s.png", exedir, names[i]);
+        if (exedir[0]) snprintf(candidates[c++], PATH_MAX, "%s/icons/ui/%s.png", exedir, names[i]);
+        snprintf(candidates[c++], PATH_MAX, "src/icons/ui/%s.png", names[i]);
+        snprintf(candidates[c++], PATH_MAX, "/usr/local/share/gnuchanfilemanager/icons/ui/%s.png", names[i]);
+        snprintf(candidates[c++], PATH_MAX, "/usr/share/gnuchanfilemanager/icons/ui/%s.png", names[i]);
+        if (home) snprintf(candidates[c++], PATH_MAX, "%s/.local/share/gnuchanfilemanager/icons/ui/%s.png", home, names[i]);
+        for (int k = 0; k < c; k++) {
+            if (access(candidates[k], R_OK) != 0) continue;
+            XImage *img = load_ui_icon(a, candidates[k]);
+            if (img) {
+                a->ui_icons[i] = img;
+                a->ui_icon_w[i] = img->width;
+                a->ui_icon_h[i] = img->height;
+                break;
+            }
+        }
+    }
+}
+
+static void free_ui_icons(App *a) {
+    for (int i = 0; i < UI_ICON_COUNT; i++) {
+        if (a->ui_icons[i]) { XDestroyImage(a->ui_icons[i]); a->ui_icons[i] = NULL; }
+        a->ui_icon_w[i] = 0; a->ui_icon_h[i] = 0;
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Initialisation
+ * ══════════════════════════════════════════════════════════════════*/
+static int init_app(App *a, int argc, char **argv) {
+    memset(a, 0, sizeof(*a));
+
+    /* GLib/GIO need type system initialized — g_type_init is a no-op
+       in GLib >= 2.36 but calling it explicitly avoids the deprecation. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    g_type_init();
+#pragma GCC diagnostic pop
+
+    a->side_w     = SIDE_W;
+    a->list_sel   = -1;
+    a->side_sel   = -1;
+    a->menu_sel   = -1;
+    a->font_px    = FONT_PX_DEFAULT;
+    a->row_h      = ROW_H_DEFAULT;
+    a->dir_monitor = NULL;
+    a->dir_monitor_id = 0;
+    a->refresh_idle_id = 0;
+    a->places_expanded = 1;
+    a->bm_expanded = 1;
+    a->recent_expanded = 1;
+    a->dev_expanded = 1;
+    a->picker_open = 0;
+    a->picker_move = 0;
+    a->picker_dir = NULL;
+    a->picker_count = 0;
+    a->picker_sel = -1;
+    a->picker_scroll = 0;
+    a->dnd_press = 0;
+    a->dnd_dragging = 0;
+    a->dnd_cur_x = 0;
+    a->dnd_cur_y = 0;
+    a->dnd_index = -1;
+    a->dnd_target_side = -1;
+    a->dnd_target_item = -1;
+    a->dnd_external = 0;
+    a->xdnd_target = None;
+    a->xdnd_version = 0;
+    a->xdnd_data = NULL;
+    a->caret_on = 1;
+    a->caret_tick = 0;
+    a->xdnd_last_x = -9999;
+    a->xdnd_last_y = -9999;
+    a->layout_w = 0;
+    a->layout_h = 0;
+    a->layout_side_w = -1;
+    a->icon_mode = 1; /* default to icon view so thumbnails/icons are visible */
+    a->icon_zoom = 0;
+    a->sort_mode = SORT_NAME;
+    a->sort_desc = 0;
+    a->sel_anchor = -1;
+    a->band_active = 0;
+    a->band_press = 0;
+    a->band_x0 = a->band_y0 = a->band_x1 = a->band_y1 = 0;
+    a->band_additive = 0;
+    a->rename_active = 0;
+    a->rename_index = -1;
+    a->rename_text[0] = '\0';
+    a->rename_len = 0;
+    a->rename_cursor = 0;
+    snprintf(a->free_space, sizeof(a->free_space), "Bos alan: -");
+
+    /* config path */
+    const char *cfg_home = getenv("XDG_CONFIG_HOME");
+    if (cfg_home && cfg_home[0] == '/')
+        snprintf(a->config_path, sizeof(a->config_path),
+                 "%s/GnuChanFileManager/config.conf", cfg_home);
+    else {
+        char *hp = get_effective_home_path();
+        snprintf(a->config_path, sizeof(a->config_path),
+                 "%s/.config/GnuChanFileManager/config.conf", hp);
+        g_free(hp);
+    }
+
+    /* default address */
+    {
+        char *hp = get_effective_home_path();
+        snprintf(a->address, sizeof(a->address), "%s", hp);
+        a->address_len = (int)strlen(a->address);
+        g_free(hp);
+    }
+
+    load_config(a);
+
+    /* always start in current user's home unless an explicit path was provided */
+    if (argc < 2) {
+        char *hp = get_effective_home_path();
+        snprintf(a->address, sizeof(a->address), "%s", hp);
+        a->address_len = (int)strlen(a->address);
+        a->address_cursor = a->address_len;
+        g_free(hp);
+    }
+
+    /* copy queue */
+    pthread_mutex_init(&a->copy_mutex, NULL);
+    pthread_cond_init(&a->copy_cond, NULL);
+    pthread_create(&a->copy_thread, NULL, copy_worker, a);
+
+    /* X11 */
+    a->dpy = XOpenDisplay(NULL);
+    if (!a->dpy) { fprintf(stderr, "GnuChanFileManager: cannot open display\n"); return 0; }
+    a->scr = DefaultScreen(a->dpy);
+    a->drag_cursor = XCreateFontCursor(a->dpy, XC_fleur);
+    a->drag_icon = None;
+    a->drag_icon_draw = NULL;
+    a->drag_icon_w = a->drag_icon_h = 0;
+
+    a->win_w = WIN_W;
+    a->win_h = WIN_H;
+
+    XSetWindowAttributes wa;
+    memset(&wa, 0, sizeof(wa));
+    wa.background_pixel  = BlackPixel(a->dpy, a->scr);
+    wa.bit_gravity       = NorthWestGravity;
+    wa.event_mask        = ExposureMask | KeyPressMask | ButtonPressMask |
+                           ButtonReleaseMask | PointerMotionMask |
+                           StructureNotifyMask | PropertyChangeMask;
+    a->win = XCreateWindow(a->dpy, RootWindow(a->dpy, a->scr),
+                           60, 60, (unsigned)a->win_w, (unsigned)a->win_h,
+                           0, CopyFromParent, InputOutput, CopyFromParent,
+                           CWBackPixel | CWBitGravity | CWEventMask, &wa);
+    XSetWindowBackgroundPixmap(a->dpy, a->win, None);
+
+    /* WM hints */
+    XStoreName(a->dpy, a->win, "GnuChan File Manager");
+    XClassHint ch = {"GnuChanFileManager", "GnuChanFileManager"};
+    XSetClassHint(a->dpy, a->win, &ch);
+    a->wm_delete = XInternAtom(a->dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(a->dpy, a->win, &a->wm_delete, 1);
+    XSizeHints sh; memset(&sh, 0, sizeof(sh));
+    sh.flags = PMinSize; sh.min_width = 540; sh.min_height = 320;
+    XSetWMNormalHints(a->dpy, a->win, &sh);
+
+    /* GC */
+    a->gc = XCreateGC(a->dpy, a->win, 0, NULL);
+
+    /* Colours */
+    alloc_color(a, C_BG,       &a->bg);
+    alloc_color(a, C_PANEL,    &a->panel);
+    alloc_color(a, C_EDGE,     &a->edge);
+    alloc_color(a, C_FIELD,    &a->field);
+    alloc_color(a, C_FIELD_ON, &a->field_on);
+    alloc_color(a, C_TEXT,     &a->text);
+    alloc_color(a, C_MUTED,    &a->muted);
+    alloc_color(a, C_ACCENT,   &a->accent);
+    alloc_color(a, C_SEL,      &a->sel);
+    alloc_color(a, C_BTN,      &a->btn);
+    alloc_color(a, C_BTN_HOT,  &a->btn_hot);
+
+    /* Fonts / draw */
+    load_fonts(a);
+    if (!a->font) { fprintf(stderr, "GnuChanFileManager: no font\n"); return 0; }
+
+    /* Clipboard / XDND atoms */
+    a->atom_clipboard   = XInternAtom(a->dpy, "CLIPBOARD",                       False);
+    a->atom_targets     = XInternAtom(a->dpy, "TARGETS",                          False);
+    a->atom_gnome_files = XInternAtom(a->dpy, "x-special/gnome-copied-files",    False);
+    a->atom_uri_list    = XInternAtom(a->dpy, "text/uri-list",                    False);
+    a->atom_utf8        = XInternAtom(a->dpy, "UTF8_STRING",                      False);
+    a->xdnd_aware       = XInternAtom(a->dpy, "XdndAware", False);
+    a->xdnd_enter       = XInternAtom(a->dpy, "XdndEnter", False);
+    a->xdnd_position    = XInternAtom(a->dpy, "XdndPosition", False);
+    a->xdnd_status      = XInternAtom(a->dpy, "XdndStatus", False);
+    a->xdnd_leave       = XInternAtom(a->dpy, "XdndLeave", False);
+    a->xdnd_drop        = XInternAtom(a->dpy, "XdndDrop", False);
+    a->xdnd_finished    = XInternAtom(a->dpy, "XdndFinished", False);
+    a->xdnd_selection   = XInternAtom(a->dpy, "XdndSelection", False);
+    a->xdnd_action_copy = XInternAtom(a->dpy, "XdndActionCopy", False);
+    a->xdnd_action_move = XInternAtom(a->dpy, "XdndActionMove", False);
+    a->xdnd_type_list   = XInternAtom(a->dpy, "XdndTypeList", False);
+    {
+        long xdnd_ver = 5;
+        XChangeProperty(a->dpy, a->win, a->xdnd_aware, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&xdnd_ver, 1);
+    }
+
+    load_ui_icons(a);
+
+    /* Volume monitor */
+    a->volume_monitor = g_volume_monitor_get();
+    a->vol_add_id = g_signal_connect(a->volume_monitor, "volume-added",
+                                      G_CALLBACK(on_volume_changed), a);
+    a->vol_rem_id = g_signal_connect(a->volume_monitor, "volume-removed",
+                                      G_CALLBACK(on_volume_changed), a);
+    a->mnt_add_id = g_signal_connect(a->volume_monitor, "mount-added",
+                                      G_CALLBACK(on_volume_changed), a);
+    a->mnt_rem_id = g_signal_connect(a->volume_monitor, "mount-removed",
+                                      G_CALLBACK(on_volume_changed), a);
+
+    refresh_sidebar(a);
+
+    /* navigate to initial location */
+    GFile *start = NULL;
+    if (argc >= 2) {
+        start = g_file_new_for_commandline_arg(argv[1]);
+    } else {
+        start = g_file_new_for_commandline_arg(a->address);
+    }
+    if (start) {
+        /* prime history without adding a duplicate */
+        if (a->history_count == 0) {
+            a->history[a->history_count++] = g_object_ref(start);
+            a->history_index = 0;
+        }
+        go_to(a, start, 0);
+        g_object_unref(start);
+    }
+
+    XMapWindow(a->dpy, a->win);
+    a->running = 1;
+    return 1;
+}
+
+static void close_app(App *a) {
+    /* stop copy thread */
+    pthread_mutex_lock(&a->copy_mutex);
+    a->shutting_down = 1;
+    pthread_cond_broadcast(&a->copy_cond);
+    pthread_mutex_unlock(&a->copy_mutex);
+    pthread_join(a->copy_thread, NULL);
+    pthread_mutex_destroy(&a->copy_mutex);
+    pthread_cond_destroy(&a->copy_cond);
+
+    free(a->clipboard_data);
+    free(a->xdnd_data);
+    free_ui_icons(a);
+
+    if (a->refresh_idle_id) {
+        g_source_remove(a->refresh_idle_id);
+        a->refresh_idle_id = 0;
+    }
+    if (a->dir_monitor) {
+        if (a->dir_monitor_id)
+            g_signal_handler_disconnect(a->dir_monitor, a->dir_monitor_id);
+        g_file_monitor_cancel(a->dir_monitor);
+        g_object_unref(a->dir_monitor);
+        a->dir_monitor = NULL;
+    }
+
+    /* free entries */
+    for (int i = 0; i < a->entry_count; i++)
+        if (a->entries[i].file) g_object_unref(a->entries[i].file);
+
+    side_free_all(a);
+
+    for (int i = 0; i < a->bookmark_count; i++) g_object_unref(a->bookmarks[i]);
+    for (int i = 0; i < a->recent_count;   i++) g_object_unref(a->recent[i]);
+    for (int i = 0; i < a->history_count;  i++) g_object_unref(a->history[i]);
+
+    if (a->location)   g_object_unref(a->location);
+    if (a->props_file) g_object_unref(a->props_file);
+
+    /* volume monitor */
+    if (a->volume_monitor) {
+        g_signal_handler_disconnect(a->volume_monitor, a->vol_add_id);
+        g_signal_handler_disconnect(a->volume_monitor, a->vol_rem_id);
+        g_signal_handler_disconnect(a->volume_monitor, a->mnt_add_id);
+        g_signal_handler_disconnect(a->volume_monitor, a->mnt_rem_id);
+        g_object_unref(a->volume_monitor);
+    }
+
+    /* X11 */
+    if (a->drag_icon_draw) XftDrawDestroy(a->drag_icon_draw);
+    if (a->drag_icon)      XDestroyWindow(a->dpy, a->drag_icon);
+    if (a->drag_cursor)    XFreeCursor(a->dpy, a->drag_cursor);
+    if (a->draw)           XftDrawDestroy(a->draw);
+    if (a->backbuf)        XFreePixmap(a->dpy, a->backbuf);
+    if (a->font_bold && a->font_bold != a->font)
+        XftFontClose(a->dpy, a->font_bold);
+    if (a->font)           XftFontClose(a->dpy, a->font);
+    if (a->gc)             XFreeGC(a->dpy, a->gc);
+    if (a->win)            XDestroyWindow(a->dpy, a->win);
+    if (a->dpy)            XCloseDisplay(a->dpy);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * main
+ * ══════════════════════════════════════════════════════════════════*/
+int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
+        printf("GnuChan File Manager %s\n", APP_VERSION);
         return 0;
     }
-    app.copy_thread = g_thread_new("gfm-copy-queue", copy_worker, &app);
-    GtkApplication *application = gtk_application_new(
-        APP_ID, G_APPLICATION_HANDLES_OPEN);
-    g_signal_connect(application, "activate", G_CALLBACK(app_activate), &app);
-    g_signal_connect(application, "open", G_CALLBACK(app_open), &app);
-    int status = g_application_run(G_APPLICATION(application), argc, argv);
-    g_object_unref(application);
-    app_free(&app);
-    return status;
+
+    static App app;
+    if (!init_app(&app, argc, argv)) return 1;
+
+    /* event loop */
+    int xfd = ConnectionNumber(app.dpy);
+    while (app.running) {
+        /* pump GLib (volumes, async copies) */
+        pump_glib();
+
+        /* wait for X or GLib events */
+        if (!XPending(app.dpy)) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(xfd, &fds);
+            struct timeval tv = {0, 50000}; /* 50 ms tick */
+            select(xfd + 1, &fds, NULL, NULL, &tv);
+        }
+
+        while (XPending(app.dpy)) {
+            XEvent ev;
+            XNextEvent(app.dpy, &ev);
+            switch (ev.type) {
+            case Expose:
+                if (ev.xexpose.count == 0) draw_app(&app);
+                break;
+            case ConfigureNotify:
+                if (ev.xconfigure.width  != app.win_w ||
+                    ev.xconfigure.height != app.win_h) {
+                    app.win_w = ev.xconfigure.width;
+                    app.win_h = ev.xconfigure.height;
+                    recreate_backbuf(&app);
+                    draw_app(&app);
+                }
+                break;
+            case KeyPress:
+                handle_key(&app, &ev.xkey);
+                break;
+            case ButtonPress:
+                handle_button_press(&app, &ev.xbutton);
+                handle_click_or_dblclick(&app, &ev.xbutton);
+                break;
+            case ButtonRelease:
+                handle_button_release(&app, &ev.xbutton);
+                break;
+            case MotionNotify:
+                /* coalesce motion events to reduce redraws */
+                while (XPending(app.dpy)) {
+                    XEvent next;
+                    XPeekEvent(app.dpy, &next);
+                    if (next.type != MotionNotify) break;
+                    XNextEvent(app.dpy, &next);
+                    ev = next;
+                }
+                handle_motion(&app, &ev.xmotion);
+                break;
+            case SelectionRequest:
+                /* handle XDND selection requests */
+                if (ev.xselectionrequest.selection == app.xdnd_selection) {
+                    XSelectionEvent sev = {0};
+                    sev.type = SelectionNotify; sev.requestor = ev.xselectionrequest.requestor;
+                    sev.selection = ev.xselectionrequest.selection; sev.target = ev.xselectionrequest.target;
+                    sev.time = ev.xselectionrequest.time; sev.property = None;
+                    if (app.xdnd_data && (ev.xselectionrequest.target == app.atom_uri_list ||
+                                          ev.xselectionrequest.target == app.atom_utf8 ||
+                                          ev.xselectionrequest.target == app.atom_gnome_files)) {
+                        Atom prop = ev.xselectionrequest.property ? ev.xselectionrequest.property : ev.xselectionrequest.target;
+                        XChangeProperty(app.dpy, ev.xselectionrequest.requestor, prop,
+                                        ev.xselectionrequest.target, 8, PropModeReplace,
+                                        (unsigned char*)app.xdnd_data, (int)strlen(app.xdnd_data));
+                        sev.property = prop;
+                    } else if (ev.xselectionrequest.target == app.atom_targets) {
+                        Atom prop = ev.xselectionrequest.property ? ev.xselectionrequest.property : app.atom_targets;
+                        Atom t[3] = { app.atom_uri_list, app.atom_utf8, app.atom_gnome_files };
+                        XChangeProperty(app.dpy, ev.xselectionrequest.requestor, prop,
+                                        XA_ATOM, 32, PropModeReplace, (unsigned char*)t, 3);
+                        sev.property = prop;
+                    }
+                    XSendEvent(app.dpy, ev.xselectionrequest.requestor, False, 0, (XEvent*)&sev);
+                } else {
+                    handle_selection_request(&app, &ev.xselectionrequest);
+                }
+                break;
+            case SelectionNotify:
+                handle_selection_notify(&app, &ev.xselection);
+                break;
+            case SelectionClear:
+                free(app.clipboard_data);
+                app.clipboard_data = NULL;
+                break;
+            case ClientMessage:
+                if ((Atom)ev.xclient.data.l[0] == app.wm_delete)
+                    app.running = 0;
+                else if (ev.xclient.message_type == app.xdnd_status ||
+                         ev.xclient.message_type == app.xdnd_finished) {
+                    /* acknowledge; no-op for basic source */
+                }
+                break;
+            }
+        }
+
+        /* caret blink + copy progress redraw (throttled) */
+        {
+            int need_draw = 0;
+            static int copy_tick = 0;
+            if (app.address_focused || app.search_focused || app.dialog_open) {
+                app.caret_tick++;
+                if (app.caret_tick >= 10) { /* ~500ms at 50ms tick */
+                    app.caret_tick = 0;
+                    app.caret_on = !app.caret_on;
+                    need_draw = 1;
+                }
+            } else {
+                if (!app.caret_on) app.caret_on = 1;
+                app.caret_tick = 0;
+            }
+            pthread_mutex_lock(&app.copy_mutex);
+            int cr = app.copy_running;
+            pthread_mutex_unlock(&app.copy_mutex);
+            if (cr) {
+                if (++copy_tick >= 4) { copy_tick = 0; need_draw = 1; } /* ~200ms */
+            } else {
+                copy_tick = 0;
+            }
+            if (need_draw) draw_app(&app);
+        }
+    }
+
+    save_config(&app);
+    close_app(&app);
+    return 0;
 }
